@@ -85,9 +85,10 @@ def test_disk_collision_geometry():
     assert g.disk_collides(0.15, 0.15, 0.04) is False
     assert g.disk_collides(0.15, 0.15, 0.06) is True
     assert g.disk_collides(-0.01, 0.15, 0.0) is True  # 越界即碰撞
-    # margin 判定：x=-0.01 无 margin 落在边界线上不算越界，加 margin 即越界
-    assert g.world_in_bounds(-0.01, 0.15) is True
-    assert g.world_in_bounds(-0.01, 0.15, margin=0.05) is False
+    # 闭区间：边界点在内，边界外即越界；加 margin 后边界点也判越界
+    assert g.world_in_bounds(0.0, 0.15) is True
+    assert g.world_in_bounds(-0.01, 0.15) is False
+    assert g.world_in_bounds(0.0, 0.15, margin=0.05) is False
 
 
 def test_out_of_bounds_world_coordinates_distinguishable():
