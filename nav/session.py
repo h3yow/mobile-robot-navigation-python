@@ -14,7 +14,6 @@ import time
 from .controller import TrajectoryTracker
 from .errors import (
     SessionStateError,
-    StartInObstacleError,
 )
 from .grid import OccupancyGrid, rasterize_rect
 from .models import (
