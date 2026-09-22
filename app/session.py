@@ -31,7 +31,7 @@ from enum import Enum
 from app.errors import ErrorCode, NavigationError
 from app.gridmap import OccupancyGrid
 from app.kinematics import Kinematics
-from app.planner import Plan, PlannerConfig, inflate_grid, plan_global
+from app.planner import Plan, PlannerConfig, plan_global
 from app.tracker import StepResult, TrackerConfig, pure_pursuit_step
 
 

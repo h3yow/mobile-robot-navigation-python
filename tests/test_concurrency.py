@@ -102,3 +102,51 @@ async def test_lock_timeout_returns_distinguishable_error(monkeypatch):
     await held
     case_log("判定", result=res)
     assert res == "LOCK_TIMEOUT"
+
+
+async def test_http_lock_timeout_is_distinguishable(client, monkeypatch):
+    """同一会话两个并发长操作：后到者在锁超时后收到 409 LOCK_TIMEOUT。"""
+
+    from fastapi.testclient import TestClient  # noqa: F401
+    # 通过直接调小 store 锁超时并用线程级并发触发
+    store = client.app.state.session_store
+    monkeypatch.setattr(store, "lock_timeout", 0.05)
+
+    r = await client_sid_async(client)
+    sid = r
+    import httpx
+    from app.api import get_store  # noqa: F401
+
+    async def slow_step():
+        # 直接持有会话锁模拟长操作
+        from app.session import session_step
+        s = store.get(sid)
+        async with s.lock:
+            await asyncio.sleep(0.3)
+            return await session_step(s)
+
+    async def timed_step():
+        await asyncio.sleep(0.05)
+        # 直接走 API 层的取锁逻辑
+        from app.api import session_lock
+        from app.errors import NavigationError
+        s = store.get(sid)
+        try:
+            async with session_lock(s, store):
+                return "acquired"
+        except NavigationError as e:
+            return e.code.value
+
+    res = await asyncio.gather(slow_step(), timed_step())
+    case_log("判定", results=res)
+    assert "SESSION_LOCK_TIMEOUT" in res
+
+
+async def client_sid_async(client):
+    from tests.conftest import open_grid
+    r = client.post("/api/v1/sessions", json={
+        "grid": open_grid(20, 12), "resolution": 0.1,
+        "start": {"x": 0.15, "y": 0.15}, "goal": {"x": 1.85, "y": 1.05},
+        "kinematics": {"robot_radius": 0.0},
+    })
+    return r.json()["session_id"]

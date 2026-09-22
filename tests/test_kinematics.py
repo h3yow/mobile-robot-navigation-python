@@ -45,9 +45,7 @@ def test_arc_integration_full_circle_and_line():
 
 
 def test_clamp_respects_all_envelopes():
-    kin = default_kinematics(max_linear_speed=1.0, max_angular_speed=1.0,
-                             max_linear_speed_=None) if False else \
-        Kinematics(1.0, 1.0, 1.0, 0.1, 1.0, 0.1)
+    kin = Kinematics(1.0, 1.0, 1.0, 0.1, 1.0, 0.1)
     v, k, w = kin.clamp_command(2.0, 5.0)
     case_log("判定", cmd=(v, k, w))
     assert v == 1.0 and abs(k) <= 1.0 and abs(w) <= 1.0

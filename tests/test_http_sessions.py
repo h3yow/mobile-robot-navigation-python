@@ -191,3 +191,44 @@ def test_large_map_single_step_is_fast(client):
              status=rs.json()["status"])
     assert rs.status_code == 200
     assert step_ms < 200
+
+
+def test_occupancy_array_forms_and_origin_resolution(client):
+    """二维数组、一维数组 + width/height、非零 origin 都可建会话并规划。"""
+    grid = [[0] * 8 for _ in range(6)]
+    r1 = client.post("/api/v1/sessions", json={
+        "occupancy": grid, "resolution": 0.25, "origin": [1.0, -0.5],
+        "start": {"x": 1.125, "y": -0.375},
+        "goal": {"x": 2.625, "y": 0.625},
+        "kinematics": {"robot_radius": 0.0},
+    })
+    case_log("判定", form="2d+origin", status=r1.status_code)
+    assert r1.status_code == 201 and r1.json()["status"] == "ACTIVE"
+
+    flat = [v for row in grid for v in row]
+    r2 = client.post("/api/v1/sessions", json={
+        "occupancy": flat, "width": 8, "height": 6, "resolution": 0.25,
+        "start": {"x": 0.125, "y": 0.125},
+        "goal": {"x": 1.625, "y": 1.125},
+        "kinematics": {"robot_radius": 0.0},
+    })
+    case_log("判定", form="flat+width/height", status=r2.status_code,
+             path=r2.json().get("path_length"))
+    assert r2.status_code == 201 and r2.json()["path_length"] >= 7
+
+
+def test_replan_after_obstacle_makes_way_when_cleared_midblock(client):
+    """障碍先阻挡（封墙）→ BLOCKED；移除后再步进可恢复到达。"""
+    sid, _ = _create(client)
+    client.post(f"/api/v1/sessions/{sid}/step", json={"steps": 3})
+    snap = client.get(f"/api/v1/sessions/{sid}").json()
+    px, py = snap["remaining_path"][8]
+    row = 12 - 1 - int(py / 0.1)
+    client.post(f"/api/v1/sessions/{sid}/obstacles",
+                json={"cells": [[c, row, 1] for c in range(20)]})
+    blocked = _run_until(client, sid, target=("BLOCKED", "FAILED"), limit=30)
+    assert blocked["status"] == "BLOCKED"
+    client.post(f"/api/v1/sessions/{sid}/obstacles", json={"reset": True})
+    last = _run_until(client, sid)
+    case_log("状态迁移", final=last["status"], steps=last["step_count"])
+    assert last["status"] == "REACHED"
