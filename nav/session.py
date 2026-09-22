@@ -45,14 +45,14 @@ class NavigationSession:
         self.id = session_id
         self.base_grid = grid
         self.limits = limits
-        # 规划安全余量：用户显式配置的膨胀格数 + 足迹半径折算格数（向上取整），
-        # 保证规划出的路径与障碍的间距足以容纳连续足迹圆 + 跟踪侧向偏差。
+        # 规划安全余量：用户显式膨胀格数 + 足迹半径折算格数（向上取整）。
+        # 规划路径据此与障碍保持至少一个外接半径的间距；
+        # 跟踪阶段的切角安全由 max_curvature 速度包络 + 逐步足迹复核共同保证。
         footprint_cells = math.ceil(
-            limits.footprint_radius / grid.resolution
+            (limits.footprint_radius + 1e-9) / grid.resolution
         )
-        # 额外 1 格跟踪缓冲，吸收转弯时的侧向控制偏差
         effective_inflation = (
-            planner_params.obstacle_inflation_cells + footprint_cells + 1
+            planner_params.obstacle_inflation_cells + footprint_cells
         )
         self.planner_params = PlannerParams(
             obstacle_inflation_cells=effective_inflation,
@@ -61,10 +61,12 @@ class NavigationSession:
             cost_diagonal=planner_params.cost_diagonal,
         )
         self.user_planner_params = planner_params
-        # 前视距离下限：1.5 个栅格，保证粗分辨率下跟踪稳定
+        # 前视距离下限：同时不小于 1.5 个栅格与纯追踪几何所需的 2/max_curvature，
+        # 保证粗分辨率与大曲率约束下跟踪都稳定且不超曲率包络。
         lookahead = max(
             float(controller_params.lookahead_cells),
             1.5 * grid.resolution,
+            2.0 / limits.max_curvature,
         )
         self.controller_params = ControllerParams(
             k_linear=controller_params.k_linear,

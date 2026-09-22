@@ -152,3 +152,20 @@ def test_replan_after_static_change_manual():
     assert s.status == SessionStatus.READY
     arrived, hist, _, blocked = _drive(s, max_steps=500)
     assert arrived
+
+
+def test_large_map_step_is_fast_and_numerically_safe():
+    # 200x200 开放地图：单步执行必须为毫秒级，且位姿始终为有限值
+    n = 200
+    rows = [[0] * n for _ in range(n)]
+    s = _session(rows, footprint_radius=0.25)
+    s.plan(Pose(0.5, 0.5, 0.0), Point(n - 0.5, n - 0.5), time.time())
+    import math
+
+    t0 = time.perf_counter()
+    r = s.step(time.time())
+    dt = time.perf_counter() - t0
+    log.info("大图 %dx%d 单步耗时 %.4fs", n, n, dt)
+    assert dt < 0.5
+    assert all(math.isfinite(v) for v in (r.pose.x, r.pose.y, r.pose.theta))
+    assert all(math.isfinite(v) for v in (r.cmd.v, r.cmd.omega))

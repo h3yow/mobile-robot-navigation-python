@@ -87,22 +87,41 @@ class TrajectoryTracker:
         dx, dy = aim.x - pose.x, aim.y - pose.y
         distance = math.hypot(dx, dy)
         angle_err = _wrap_angle(math.atan2(dy, dx) - pose.theta)
-
         dt = self.params.dt
-        # 1) 期望角速度：比例控制
-        omega = self.params.k_angular * angle_err
 
-        # 2) 期望线速度：正对目标时加速，背对目标时不前进（必要时倒车受限->原地转）
-        alignment = max(0.0, math.cos(angle_err))
-        desired_v = self.params.k_linear * distance * alignment
-        # 角度偏差大时降速，避免超调
-        desired_v *= alignment
+        # 1) 期望角速度
+        #    小/中角度误差：纯追踪几何 kappa = 2*sin(alpha)/Ld，omega = v*kappa；
+        #    大角度误差（背对目标）：先比例原地转向，不前进。
+        if abs(angle_err) > math.pi / 2:
+            omega = self.params.k_angular * angle_err
+            desired_v = 0.0
+        else:
+            ld = max(distance, 1e-6)
+            curvature = 2.0 * math.sin(angle_err) / ld
+            # 期望线速度：距离比例 + 朝向对齐程度平滑降速
+            desired_v = self.params.k_linear * distance * max(
+                0.0, math.cos(angle_err)
+            )
+            omega = desired_v * curvature
+            # 叠加小比例纠偏项（仅有平移速度时生效）
+            omega += (
+                0.5
+                * self.params.k_angular
+                * angle_err
+                * min(1.0, desired_v)
+            )
+            # 曲率包络：超出 max_curvature 时等比收缩 omega，保持转弯方向
+            if abs(omega) > 1e-12:
+                scale = min(
+                    1.0, self.limits.max_curvature * desired_v / abs(omega)
+                )
+                omega *= scale
 
-        # 3) 加速度限幅（只限制前进方向的变化率）
+        # 2) 加速度限幅
         max_dv = self.limits.max_acc * dt
         desired_v = max(previous_v - max_dv, min(previous_v + max_dv, desired_v))
 
-        # 4) 全包络限幅（速度/角速度/曲率）
+        # 3) 全包络限幅（速度/角速度/曲率）
         v, omega = self.limits.clamp_command(desired_v, omega)
 
         # 5) 数值稳定：极小速度归零，避免产生“原地漂移”
