@@ -59,6 +59,7 @@ class TrackerConfig:
     goal_tolerance: float = 0.05
     heading_tolerance: float = 0.08           # rad，到达后对准目标朝向的容差
     pre_align_threshold: float = 0.35        # rad，超过先原地自转对准
+    path_horizon: float = 0.6                 # m，路径前瞻预警距离
     collision_spacing: float | None = None  # None -> min(res/2, robot_radius)
     turn_speed_fraction: float = 0.25        # 原地/大曲率时保留的速度比例
     min_speed_fraction: float = 0.12         # 爬行最低速度比例
@@ -255,6 +256,37 @@ def pure_pursuit_step(
     bearing = math.atan2(target[1] - y, target[0] - x)
     heading_error = bearing - theta
     heading_error = math.atan2(math.sin(heading_error), math.cos(heading_error))
+
+    # 路径前瞻预警：沿剩余路径走 path_horizon 米，逐折线点检查圆盘碰撞。
+    # 看到前方路径被新障碍占据即返回 blocked（不移动），交给会话层重规划，
+    # 这样动态障碍不必等到机器人鼻尖撞上才触发。
+    radius = kin.robot_radius
+    acc = 0.0
+    horizon_idx = nearest
+    for i in range(nearest, len(path) - 1):
+        ax, ay = path[i]
+        bx, by = path[i + 1]
+        seg = math.hypot(bx - ax, by - ay)
+        steps_on_seg = max(1, math.ceil(seg / spacing))
+        for t in range(steps_on_seg + 1):
+            px = ax + (bx - ax) * t / steps_on_seg
+            py = ay + (by - ay) * t / steps_on_seg
+            if grid.disk_collides(px, py, radius):
+                sr = StepResult(
+                    x=x, y=y, theta=theta, speed=0.0, curvature=0.0,
+                    angular_speed=0.0,
+                    reached=False, blocked=True, obstructed=False,
+                    replanned=False,
+                    lookahead_index=i, progress_index=nearest,
+                    distance_to_goal=dist_goal, collisions_checked=0,
+                    replan_reason="path_blocked_ahead",
+                    events=events + [f"blocked:path_blocked_ahead@{i}"],
+                )
+                return sr, (x, y, theta, 0.0), nearest
+        acc += seg
+        horizon_idx = i + 1
+        if acc >= cfg.path_horizon:
+            break
 
     # 起步/重规划后朝向偏差过大：先原地自转对准前方路径方向（不位移）
     if abs(heading_error) > cfg.pre_align_threshold:
