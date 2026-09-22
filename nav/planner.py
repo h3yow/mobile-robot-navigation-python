@@ -70,6 +70,13 @@ class GridPlanner:
 
         # 4) 段级足迹碰撞复核（处理压缩后长直段跨角切割障碍的情况）
         points = self._verify_segments(points, g)
+        # 5) 起终点同格时去掉重复端点
+        if (
+            len(points) == 2
+            and abs(points[0].x - points[1].x) < 1e-12
+            and abs(points[0].y - points[1].y) < 1e-12
+        ):
+            points = points[:1]
         return points
 
     # ------------------------------------------------------------------

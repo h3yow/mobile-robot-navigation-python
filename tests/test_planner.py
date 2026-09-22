@@ -151,3 +151,38 @@ def test_diagonal_corner_cutting_forbidden():
     path = pl.plan(Point(0.5, 0.5), Point(3.5, 3.5))
     assert pl.is_path_clear(path, 0.0) == -1
     log.info("对角障碍不穿墙角，路径 %s", [(p.x, p.y) for p in path])
+
+
+def test_single_cell_empty_map_start_equals_goal():
+    # 1x1 空地图、零足迹近似（足迹必须放得下由 footprint 校验负责）
+    g = OccupancyGrid.from_raw([[0]], resolution=1.0)
+    from nav.models import Point as P
+    from nav.planner import GridPlanner
+    from nav.models import PlannerParams as PP
+
+    path = GridPlanner(g, PP(obstacle_inflation_cells=0)).plan(
+        P(0.5, 0.5), P(0.5, 0.5)
+    )
+    log.info("1x1 空地图起终点重合 -> 路径 %s", [(p.x, p.y) for p in path])
+    assert len(path) == 1
+
+
+def test_open_empty_room_straight_diagonal():
+    # 完全空旷大房间
+    rows = [[0] * 20 for _ in range(20)]
+    g, pl = _planner(rows)
+    path = pl.plan(Point(0.5, 0.5), Point(19.5, 19.5))
+    log.info("空旷房间 -> 压缩为 %d 段直线路径", len(path) - 1)
+    assert len(path) == 2
+    assert pl.is_path_clear(path, 0.0) == -1
+
+
+def test_on_map_border_coordinate_in_bounds():
+    g = OccupancyGrid.from_raw([[0] * 3 for _ in range(3)], resolution=1.0)
+    # 右/上边界坐标本身越界（半开区间 [origin, origin+n*res)）
+    with pytest.raises(CoordinateOutOfBoundsError):
+        g.world_to_cell(3.0, 0.0)
+    # 紧贴边界内侧合法
+    cx, cy = g.world_to_cell(2.999, 2.999)
+    assert (cx, cy) == (2, 2)
+    log.info("贴边坐标 (2.999,2.999) 合法 -> (2,2)；边界 (3.0,*) 越界")
