@@ -139,7 +139,8 @@ class ControllerParams:
     k_linear: float = 1.0
     k_angular: float = 2.0
     goal_tolerance: float = 0.05
-    lookahead_cells: int = 2
+    # 纯追踪前视距离（米）；会话创建时会结合栅格分辨率做下限保护
+    lookahead_cells: float = 0.6
     dt: float = 0.1
 
     def __post_init__(self) -> None:

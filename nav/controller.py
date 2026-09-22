@@ -43,29 +43,37 @@ class TrajectoryTracker:
     ) -> tuple[Point, int]:
         """在路径上选择前视点，并推进路径下标。
 
-        规则：从当前下标开始，丢弃已落在身后的路径点（点在机体坐标系 x<0），
-        再向前取 lookahead_cells 个点作为前视点；到达路径末端时直接瞄准终点。
+        规则：
+          1. 从当前下标开始，若下一路径点比当前点更近（说明已越过当前点），
+             则推进下标——但被越过点仍可能是最近点，不可盲目跳过；
+          2. 前视点沿路径累计欧氏距离达到 lookahead 距离为止；
+          3. 到达路径末端时直接瞄准终点。
         """
         if not path:
             raise ValueError("find_aim_point: 空路径")
         idx = max(0, min(path_index, len(path) - 1))
 
-        # 推进：当前点已非常接近，或落在机体后方
+        # 推进到“剩余路径”上离机器人最近的顶点
         while idx < len(path) - 1:
-            pt = path[idx]
-            dx, dy = pt.x - pose.x, pt.y - pose.y
-            distance = math.hypot(dx, dy)
-            if distance <= self.params.goal_tolerance:
-                idx += 1
-                continue
-            # 机体坐标系下的纵向坐标
-            local_x = dx * math.cos(-pose.theta) - dy * math.sin(-pose.theta)
-            if local_x < -self.params.goal_tolerance:
+            d_cur = math.hypot(path[idx].x - pose.x, path[idx].y - pose.y)
+            d_next = math.hypot(path[idx + 1].x - pose.x, path[idx + 1].y - pose.y)
+            if d_next <= d_cur:
                 idx += 1
                 continue
             break
 
-        target_idx = min(len(path) - 1, idx + self.params.lookahead_cells)
+        # 沿路径向前取累计距离达到前视距离的点
+        lookahead = self.params.lookahead_cells  # 以米解释（默认参数与分辨率同量级）
+        target_idx = idx
+        accum = 0.0
+        while target_idx < len(path) - 1:
+            a, b = path[target_idx], path[target_idx + 1]
+            seg = math.hypot(b.x - a.x, b.y - a.y)
+            if accum + seg >= lookahead:
+                target_idx += 1
+                break
+            accum += seg
+            target_idx += 1
         return path[target_idx], idx
 
     def compute_command(
