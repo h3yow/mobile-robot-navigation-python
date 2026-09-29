@@ -68,7 +68,10 @@ class OccupancyGrid:
     origin 为栅格单元 (0,0) 左下角对应的世界坐标；resolution 为米/格。
     """
 
-    __slots__ = ("width", "height", "resolution", "origin_x", "origin_y", "data")
+    __slots__ = (
+        "width", "height", "resolution", "origin_x", "origin_y", "data",
+        "_proximity",
+    )
 
     def __init__(
         self,
@@ -85,6 +88,7 @@ class OccupancyGrid:
         self.origin_x = origin_x
         self.origin_y = origin_y
         self.data = data
+        self._proximity: "ProximityIndex | None" = None
 
     # ---- 构建与校验 ----
     @classmethod
@@ -260,6 +264,54 @@ class OccupancyGrid:
             self.origin_x, self.origin_y, merged_data,
         )
 
+    # ---- 连续运动安全 ----
+    def segment_footprint_blocked(
+        self,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        radius: float,
+        spacing: float | None = None,
+    ) -> bool:
+        """检查从 (x0,y0) 到 (x1,y1) 的直线扫掠过程中外接圆是否触障/越界。
+
+        采样步长不超过 spacing（缺省为 1/4 栅格），并且每个采样点都以
+        ``radius + spacing/2`` 做半径膨胀复核，因此任意两个相邻采样之间
+        机器人中心移动不超过 spacing，真实外接圆与所检圆之间的间隙被覆盖，
+        从机制上杜绝“大步长跨过薄墙/窄通道”的漏检。
+        """
+        dist = math.hypot(x1 - x0, y1 - y0)
+        step = spacing if spacing is not None else self.resolution * 0.25
+        if step <= 0:
+            step = self.resolution * 0.25
+        check_r = radius + step * 0.5
+        n = max(1, math.ceil(dist / step))
+        for i in range(n + 1):
+            t = i / n
+            x = x0 + (x1 - x0) * t
+            y = y0 + (y1 - y0) * t
+            if self.footprint_blocked(x, y, check_r):
+                return True
+        return False
+
+    def clearance_at(self, x: float, y: float) -> float:
+        """返回世界点 (x,y) 到最近障碍表面（或地图世界边界）的距离（米）。
+
+        点位于障碍内时返回 0.0；地图外返回 0.0。结果基于栅格分辨率离散，
+        精度约为一个栅格量级（预演报告用途，碰撞判定仍以 footprint_blocked
+        的精确圆-矩形检测为准）。
+        """
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return 0.0
+        cx = math.floor((x - self.origin_x) / self.resolution)
+        cy = math.floor((y - self.origin_y) / self.resolution)
+        if not self.in_bounds(cx, cy):
+            return 0.0
+        if self._proximity is None:
+            self._proximity = ProximityIndex.build(self)
+        return self._proximity.surface_clearance(self, cx, cy, x, y)
+
     def inflated(self, radius_cells: int) -> "OccupancyGrid":
         """按 Chebyshev 距离 <= radius_cells 做障碍膨胀（保守膨胀，含对角方向）。"""
         if radius_cells <= 0:
@@ -298,3 +350,162 @@ class OccupancyGrid:
 
     def clone_data(self) -> list[int]:
         return list(self.data)
+
+
+class ProximityIndex:
+    """障碍邻近索引：基于 Felzenszwalb 精确欧氏距离变换（栅格中心坐标）。
+
+    每个自由格记录最近障碍格的栅格坐标；查询世界点时取该格及其 8 邻域
+    障碍格，对点-障碍矩形做精确最近点距离，并与到地图世界边界的距离取 min。
+    建索引为 O(W·H)，单次查询为 O(1)，适合预演在大地图上反复查询。
+    """
+
+    __slots__ = ("nearest_x", "nearest_y", "resolution")
+
+    def __init__(self, nearest_x: list[int], nearest_y: list[int],
+                 resolution: float) -> None:
+        self.nearest_x = nearest_x
+        self.nearest_y = nearest_y
+        self.resolution = resolution
+
+    @classmethod
+    def build(cls, grid: OccupancyGrid) -> "ProximityIndex":
+        w, h = grid.width, grid.height
+        inf = float("inf")
+        d2: list[float] = [0.0] * (w * h)
+        nx: list[int] = [-1] * (w * h)
+        ny: list[int] = [-1] * (w * h)
+
+        # 初始代价：障碍格 0，自由格 +inf
+        f = [0.0 if v == 1 else inf for v in grid.data]
+
+        # --- 沿 x 方向的 1D 变换（逐行，站点代价 0/inf）---
+        for row in range(h):
+            base = row * w
+            dist, winner = _edt1d(f[base:base + w])
+            for col in range(w):
+                idx = base + col
+                d2[idx] = dist[col]
+                if winner[col] >= 0:
+                    nx[idx] = winner[col]
+                    ny[idx] = row
+
+        # --- 沿 y 方向的 1D 变换（逐列，偏移为 x 变换结果）---
+        for col in range(w):
+            offsets = [d2[row * w + col] for row in range(h)]
+            dist, winner = _edt1d(offsets)
+            for row in range(h):
+                idx = row * w + col
+                d2[idx] = dist[row]
+                src_row = winner[row]
+                if src_row >= 0:
+                    src_idx = src_row * w + col
+                    nx[idx] = nx[src_idx]
+                    ny[idx] = ny[src_idx]
+
+        return cls(nx, ny, grid.resolution)
+
+    def surface_clearance(
+        self, grid: OccupancyGrid, cx: int, cy: int, x: float, y: float
+    ) -> float:
+        # 到地图世界边界的距离（边界按“墙”处理）
+        boundary = min(
+            x - grid.origin_x,
+            grid.origin_x + grid.width * grid.resolution - x,
+            y - grid.origin_y,
+            grid.origin_y + grid.height * grid.resolution - y,
+        )
+        boundary = max(0.0, boundary)
+        if grid.data[cy * grid.width + cx] == 1:
+            return 0.0
+        sx = self.nearest_x[cy * grid.width + cx]
+        sy = self.nearest_y[cy * grid.width + cx]
+        if sx < 0:
+            # 全自由图：没有障碍格，只受边界约束
+            return boundary
+        half = grid.resolution / 2
+        r = self.resolution
+        diag_half = r * 0.70710678  # 格心到格角的距离
+
+        def _rect_dist(gx: int, gy: int) -> float:
+            ccx = grid.origin_x + (gx + 0.5) * r
+            ccy = grid.origin_y + (gy + 0.5) * r
+            qx = min(max(x, ccx - half), ccx + half)
+            qy = min(max(y, ccy - half), ccy + half)
+            return math.hypot(qx - x, qy - y)
+
+        # 最近障碍格给出表面距离上界（其格心距离 - 对角半宽也是下界参考）
+        best = _rect_dist(sx, sy)
+        # 以查询点为中心圈定候选窗口：表面距离能 < best 的障碍格，其格心到
+        # 查询点的距离必 < best + 格对角半宽。近墙时窗口只有 1~3 格，
+        # 空旷处按最近障碍距离封顶，单次查询为亚线性小常数。
+        radius_m = best + diag_half + r
+        R = math.ceil(radius_m / r) + 1
+        x0 = max(0, cx - R)
+        x1 = min(grid.width - 1, cx + R)
+        y0 = max(0, cy - R)
+        y1 = min(grid.height - 1, cy + R)
+        for gy0 in range(y0, y1 + 1):
+            base = gy0 * grid.width
+            for gx0 in range(x0, x1 + 1):
+                if gx0 == sx and gy0 == sy:
+                    continue
+                if grid.data[base + gx0] != 1:
+                    continue
+                ccx = grid.origin_x + (gx0 + 0.5) * r
+                ccy = grid.origin_y + (gy0 + 0.5) * r
+                # 格心到查询点距离减对角半宽 = 表面距离的严格下界
+                if math.hypot(ccx - x, ccy - y) - diag_half >= best:
+                    continue
+                best = min(best, _rect_dist(gx0, gy0))
+
+        return max(0.0, min(best, boundary))
+
+
+def _edt1d(f: list[float]) -> tuple[list[float], list[int]]:
+    """一维 Felzenszwalb 平方距离变换。
+
+    输入 f[i] 为站点偏移代价（站点处为 0，其余 +inf），输出：
+      dist[i]   = min_q (i - q)^2 + f[q]
+      winner[i] = 取得最小值的站点下标（无站点时为 -1）
+    抛物线包络算法，复杂度 O(n)。
+    """
+    n = len(f)
+    inf = float("inf")
+    v = [0] * n  # 包络上各抛物线对应的站点
+    z = [0.0] * (n + 1)  # 相邻抛物线交点
+
+    # 用第一个有限站点（障碍格）初始化包络，+inf 站点不参与构造
+    first = next((i for i, val in enumerate(f) if math.isfinite(val)), -1)
+    if first < 0:
+        return [inf] * n, [-1] * n
+
+    k = 0
+    v[0] = first
+    z[0] = -inf
+    z[1] = inf
+    for q in range(first + 1, n):
+        if not math.isfinite(f[q]):
+            continue
+        while True:
+            denom = 2 * q - 2 * v[k]
+            s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / denom
+            if s <= z[k] and k > 0:
+                k -= 1
+                continue
+            break
+        k += 1
+        v[k] = q
+        z[k] = s
+        z[k + 1] = inf
+
+    dist = [0.0] * n
+    winner = [-1] * n
+    k = 0
+    for i in range(n):
+        while z[k + 1] < i:
+            k += 1
+        q = v[k]
+        dist[i] = (i - q) ** 2 + f[q]
+        winner[i] = q
+    return dist, winner

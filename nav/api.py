@@ -6,6 +6,9 @@
   GET    /sessions/{id}                  查询状态快照
   POST   /sessions/{id}/plan             设置起终点并全局规划
   POST   /sessions/{id}/step             单步执行（可携带 dynamic_obstacles）
+  POST   /sessions/{id}/advance          按指定时长连续推进（dt/max_v 可调）
+  GET    /sessions/{id}/trajectory       查询保留的执行轨迹（含扫掠位姿）
+  POST   /sessions/{id}/rehearse         只读预演（不改会话状态）
   POST   /sessions/{id}/replan           手动触发重规划
   POST   /sessions/{id}/reset            重置会话
   DELETE /sessions/{id}                  删除会话
@@ -77,8 +80,28 @@ async def step_session(request: Request, session_id: str) -> dict:
     )
 
 
+@router.post("/sessions/{session_id}/advance")
+async def advance_session(request: Request, session_id: str) -> dict:
+    body = await _read_json(request)
+    return get_service(request).advance_session(
+        session_id, body, _idem_key(request)
+    )
+
+
+@router.get("/sessions/{session_id}/trajectory")
+def get_trajectory(request: Request, session_id: str) -> dict:
+    return get_service(request).get_trajectory(session_id)
+
+
+@router.post("/sessions/{session_id}/rehearse")
+async def rehearse_session(request: Request, session_id: str) -> dict:
+    body = await _read_json(request)
+    return get_service(request).rehearse_session(session_id, body)
+
+
 @router.post("/sessions/{session_id}/replan")
 def replan_session(request: Request, session_id: str) -> dict:
+    return get_service(request).replan_session(session_id)
     return get_service(request).replan_session(session_id)
 
 

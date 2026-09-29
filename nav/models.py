@@ -166,6 +166,55 @@ class StepResult:
     arrived: bool
     blocked: bool
     note: str
+    # 本微步实际模拟的时长（秒）。完整微步等于 dt；部分推进时 < dt；
+    # 未发生运动（到达/被挡零速）时为 0.0。默认 0.0 保持旧构造兼容。
+    elapsed: float = 0.0
+
+
+@dataclass(slots=True)
+class TrajectoryRecord:
+    """单个微步的执行轨迹记录。
+
+    swept 为本微步实际扫过的稠密位姿采样：swept[0] 为运动前位姿，
+    swept[-1] 为本步上报位姿（== pose）。把各记录首尾相接即可还原连续轨迹，
+    且每个记录的 pose 与对外 StepResult 位姿序列、step_count 一一对应。
+    """
+
+    step: int
+    pose: Pose
+    cmd: Twist
+    swept: list[Pose]
+    dt: float
+
+
+@dataclass(slots=True)
+class AdvanceResult:
+    """一次按时长推进的结果（可能由多个内部微步组成）。"""
+
+    status: SessionStatus
+    pose: Pose
+    requested_duration: float
+    simulated_duration: float
+    steps_executed: int
+    completed: bool
+    arrived: bool
+    blocked: bool
+    reason: str
+    results: list[StepResult] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class RehearsalReport:
+    """只读预演结果：不改动任何会话状态。"""
+
+    feasible: bool
+    completed: bool
+    duration: float
+    steps: int
+    min_clearance: float
+    failure_index: int | None
+    failure_step: int | None
+    reason: str
 
 
 @dataclass(slots=True)

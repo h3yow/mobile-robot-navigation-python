@@ -67,6 +67,10 @@ y'   = y + v·sin(θ)·dt
 * 每个步进在**积分前**（当前位姿）与**积分后**（预测位姿）各做一次足迹碰撞复核；
   预测位姿触障则拒绝该指令（输出零速并进入 `BLOCKED`），从机制上保证
   **任何时刻轨迹都不穿越障碍、不越界、不超速度/曲率限制**。
+* `advance` 长时推进时进一步对整条微步圆弧做**扫掠复核**：沿弧以
+  `≤ min(resolution/4, 0.2m)` 弦长采样，并以 `footprint_radius + 间距/2`
+  的膨胀半径逐点检测，因此**两次上报位姿之间**（哪怕位移远大于墙厚/通道宽）
+  也不穿障、不越界；走不下时二分取最大可行片段，详见 4A.1。
 
 ### 2.4 A\* 代价模型
 
@@ -117,6 +121,19 @@ y'   = y + v·sin(θ)·dt
 | | `goal_tolerance` | 0.05 | 到点容差 (m) |
 | | `lookahead_cells` | 0.6 | 纯追踪前视距离 (m)，会话层有下限保护 |
 | | `dt` | 0.1 | 仿真步长 (s) |
+| 会话 | `trajectory_limit` | 2000 | 每个会话保留的执行轨迹记录条数上限 |
+
+### 3.4 长时推进参数（`advance`，可选，不传时与逐步 `step` 行为一致）
+
+| 字段 | 默认 | 含义/范围 |
+|---|---|---|
+| `duration` | （必填） | 本次一次推进要模拟的时长（秒）；`(0, 60]` |
+| `dt` | 会话 `controller.dt`（0.1s） | 本次推进的微步间隔（秒），可取秒级 |
+| `max_v` | 会话 `limits.max_v`（1.0 m/s） | 本次推进的临时速度上限（m/s），可调高 |
+
+`dt`/`max_v` **只对本次 `advance` 调用生效**，不修改会话的默认配置；
+不传它们时，`advance` 的每一步与连续调用 `step` 使用完全相同的参数与运动学
+（见 11.3 兼容性）。
 
 ---
 
@@ -149,6 +166,131 @@ y'   = y + v·sin(θ)·dt
 单步 `step` 内部顺序（整体在会话锁内原子完成）：
 重建有效栅格 → 当前位姿安全检查 → 剩余路径通畅性检查 →（被挡则）自动重规划
 → 到点判定 → 选前视点/算受约束指令 → 积分 → 预测位姿碰撞复核 → 更新状态。
+
+---
+
+## 4A. 长时运行的三种能力
+
+### 4A.1 按指定时长推进 `advance`
+
+`POST /sessions/{id}/advance` 在一次调用内模拟最多 `duration` 秒的连续运动，
+内部按 `dt` 拆成若干微步顺序执行，避免“每挪一点点就调一次接口”。
+
+请求体：
+
+```json
+{ "duration": 10.0, "dt": 0.5, "max_v": 3.0,
+  "dynamic_obstacles": [[6.0, 0.0, 7.0, 4.0]] }
+```
+
+返回（节选）：
+
+```json
+{ "advance": {
+    "status": "running|arrived|blocked",
+    "pose": {"x": ..., "y": ..., "theta": ...},
+    "requested_duration": 10.0,
+    "simulated_duration": 8.4,
+    "steps_executed": 17,
+    "completed": false, "arrived": false, "blocked": true,
+    "reason": "推进途中剩余路线被障碍/边界阻挡，已在最后安全位置停住……",
+    "results": [ /* 每个微步一个与 step 同构的 StepResult（含 elapsed）*/ ] } }
+```
+
+**整段运动的安全保证（与步长无关）。** 即使一次推进很长、`dt` 到秒级、
+单步位移比通道宽度或隔墙厚度还大，也不会穿障：
+
+* 每个微步都沿**恒定 v/ω 的精确圆弧**以不超过 `min(resolution/4, 0.2m)`
+  的弦长采样“扫过的位姿”，并对每个采样点用
+  `footprint_radius + 采样间距/2` 的**膨胀半径**做足迹复核；
+  相邻采样之间的“隧穿”缝隙因此被覆盖——5cm 薄墙也无法用 5m 的单步位移跨过。
+* 越出地图世界边界与撞障碍同等对待（边界即墙）。
+* 每条指令都先经加速度、速度、角速度、曲率包络限幅，再复核执行，
+  因此不超速度/曲率/加速度限制。
+
+**能走多少走多少。** 当一整个微步走不下时，会在该微步内做二分，
+找到最大可行时长比例并停在安全位置（对应 `StepResult.blocked=true`
+且 `0 < elapsed < dt`）；任何微小运动都触障则**零速原地停住**
+（`elapsed=0`，状态 `BLOCKED`）。`simulated_duration` 给出实际成功模拟的秒数，
+`reason` 说明为什么没走满。
+
+**停住/被挡后会话继续可用。** 状态、目标与路径都保留：之后可以
+再次 `advance` / `step`（环境恢复后自动重规划继续）、更换 `dynamic_obstacles`、
+`replan` 或 `reset`，不会卡死。到达终点提前结束也视为 `completed=true`。
+
+保护上限：`duration ≤ 60s`、单次最多 `20000` 个微步（超限返回已安全模拟的部分）。
+
+### 4A.2 执行轨迹查询 `trajectory`
+
+`GET /sessions/{id}/trajectory` 返回本会话实际走过的轨迹，**不只是起止点**：
+
+```json
+{ "records": [ {
+      "step": 1,
+      "pose": {"x": ..., "y": ..., "theta": ...},
+      "cmd":  {"v": ..., "omega": ...},
+      "dt": 0.1,
+      "swept": [ {"x":..,"y":..,"theta":..}, ... ] } ],
+  "limit": 2000, "retained": 2000, "dropped": 35, "total": 2035,
+  "session": { /* 状态快照 */ } }
+```
+
+* 每个**真实发生运动**的微步产生一条 `record`，其 `step` 与历史
+  `StepResult` 的 `step_count`、`pose`、`cmd`、`elapsed(=dt)` **一一对应**；
+  被挡零速/已到点这类未运动的微步不产生记录。
+* `swept` 是该微步扫过的**稠密位姿**（含起点与终点，`swept[-1] == pose`）。
+  把各记录的 `swept` 首尾相接即可还原连续轨迹，用于复现/核对是否穿墙。
+* 存储采样数每条记录封顶 **256** 点（碰撞复核用更细的采样；长直段记录点更粗，
+  但始终含中间扫过位置），避免单条记录过大。
+
+**保留上限与超限处理。** 每个会话持有一个 FIFO 环形缓冲，只保留最近
+`trajectory_limit` 条记录，**默认 2000**（创建会话时可用
+`trajectory_limit` 配置，整数且 ≥1）。超出后**丢弃最旧记录**，
+并在 `dropped` 中累计被丢弃条数；`total = retained + dropped`。
+重新 `plan` 与 `reset` 会清空轨迹与计数。**不同会话各存各的缓冲，互不影响。**
+查询返回的是副本，外部修改不影响会话内部状态。
+
+### 4A.3 只读预演 `rehearse`
+
+`POST /sessions/{id}/rehearse` 在**不改动会话状态**的前提下，
+给定一条路线和一组运行参数，先判断能否安全走完：
+
+```json
+{ "route": [{"x":0.5,"y":2.5}, {"x":39.5,"y":2.5}],   // 可省：用当前规划路线
+  "start": {"x":0.5,"y":2.5,"theta":0},                // 可省：用当前位姿
+  "duration": 60.0, "dt": 0.1, "max_v": 2.0,           // 均可省
+  "max_microsteps": 20000 }
+```
+
+返回：
+
+```json
+{ "report": {
+    "feasible": true, "completed": true,
+    "duration": 41.1, "steps": 411,
+    "min_clearance": 0.2,
+    "failure_index": null, "failure_step": null,
+    "reason": "可安全走完全程，预计 41.10 秒 / 411 个微步" } }
+```
+
+* `feasible`：在预算内能否全程**不触障、不越界、不超 v/ω/曲率/加速度约束**
+  地走到路线末端。预演执行与真实 `advance` **同一套**跟踪与扫掠碰撞逻辑，
+  但**不做自动重规划**（用于评估“按这条给定路线、这组参数”是否可行）。
+* `failure_index`：首个问题大致落在第几个路线点/段；`failure_step`
+  为第几个微步；`reason` 区分“路线被阻挡 / 时长预算用尽 / 超约束 /
+  微步预算耗尽 / 起点在障碍内”等。
+* `min_clearance`：全程**机器人净空**的最小值（到最近障碍表面或地图边界的
+  距离减去足迹半径，米）；越接近 0 越贴边，为负表示发生碰撞。
+  该值基于栅格离散，精度为栅格量级；碰撞判定本身仍用精确圆-矩形检测。
+
+**可复现与不干扰：**
+
+* 纯函数式计算：相同栅格/路线/起点/参数 → 相同结果，适合执行前检查与批量调参筛选。
+* 只读：预演后会话的位姿、`step_count`、状态、轨迹都不变。
+* 不阻塞：服务只在会话锁内取栅格/路线/位姿的副本，计算在锁外进行，
+  因此预演一个大地图时，同一会话的推进查询与**其它会话**都可正常进行。
+* 大图保护：距离查询用 O(W·H) 预建的精确欧氏距离变换索引（建一次、会话内缓存），
+  单次净空查询为亚线性小常数；另有 `max_microsteps` 预算，保证大图也能及时返回。
 
 ---
 
@@ -211,6 +353,9 @@ y'   = y + v·sin(θ)·dt
 | GET | `/sessions/{id}` | 查询状态快照 |
 | POST | `/sessions/{id}/plan` | 设置起终点并全局规划 |
 | POST | `/sessions/{id}/step` | 单步执行（可带 `dynamic_obstacles`，可选幂等键） |
+| POST | `/sessions/{id}/advance` | 按指定时长连续推进（`duration/dt/max_v`，可选幂等键） |
+| GET | `/sessions/{id}/trajectory` | 查询保留的执行轨迹（含稠密扫掠位姿） |
+| POST | `/sessions/{id}/rehearse` | 只读预演（不改会话状态） |
 | POST | `/sessions/{id}/replan` | 手动重规划 |
 | POST | `/sessions/{id}/reset` | 重置 |
 | DELETE | `/sessions/{id}` | 删除 |
@@ -220,7 +365,20 @@ last_note（关键判定与迁移依据）/ created_at / updated_at`。
 
 ---
 
-## 7. 本地验证方法
+## 8. 向后兼容与默认值
+
+* **不传新参数时行为不变**：`POST /sessions/{id}/step` 的请求/响应保持原样
+  （`StepResult` 仅新增一个带默认值的 `elapsed` 字段，旧客户端可忽略）。
+  `POST /sessions` 不传 `trajectory_limit` 时使用默认 2000。
+* `advance` 不传 `dt`/`max_v` 时，等价于在会话锁内连续执行若干次默认参数的
+  `step`（相同的 `controller.dt` 与 `limits.max_v`），逐位姿结果一致。
+* 新增端点（`advance` / `trajectory` / `rehearse`）与旧端点并存，不改变
+  旧端点路径与字段；`rehearse` 只读，不会对既有工作流产生副作用。
+* 轨迹缓冲仅记录“真实发生运动”的微步；旧的逐步 `step` 使用方式同样会留下轨迹。
+
+---
+
+## 9. 本地验证方法
 
 ```bash
 # 1) 安装依赖（需要 Python 3.14，使用 uv）
@@ -254,6 +412,17 @@ curl -s -X POST localhost:8000/sessions/<id>/plan -H 'content-type: application/
 curl -s -X POST localhost:8000/sessions/<id>/step -H 'content-type: application/json' \
   -d '{"dynamic_obstacles":[[6.0,0.0,7.0,4.0]]}'
 
+# 一次推进 10 秒（微步 0.5s、速度上限 3m/s）
+curl -s -X POST localhost:8000/sessions/<id>/advance -H 'content-type: application/json' \
+  -d '{"duration":10.0,"dt":0.5,"max_v":3.0}'
+
+# 查询执行轨迹（含每条微步的稠密扫掠位姿）
+curl -s localhost:8000/sessions/<id>/trajectory
+
+# 只读预演：按当前路线/位姿，用 dt=0.2、max_v=2 评估能否安全走完
+curl -s -X POST localhost:8000/sessions/<id>/rehearse -H 'content-type: application/json' \
+  -d '{"dt":0.2,"max_v":2.0}'
+
 # 查询
 curl -s localhost:8000/sessions/<id>
 ```
@@ -272,3 +441,16 @@ curl -s localhost:8000/sessions/<id>
 * `test_service_api.py`：**6 会话并发隔离**、同会话 4 线程并发步进无错序/撕裂、
   步进与重规划并发、创建/步进幂等与冲突、TTL 过期可区分、删除后 404、
   各类非法输入 HTTP 错误码、非零原点/细分辨率建图规划。
+* `test_advance.py`：**100m 长走廊一次大跨度（dt=1s、v=5m/s）安全走完**、
+  **5cm 薄墙在 5m 单步位移下不被穿透**、窄口高速被安全拦截且会话可继续、
+  部分微步二分停在墙前、封死墙零速 BLOCKED→清障恢复、
+  非法 duration/dt/max_v 拒绝、默认参数与逐步 `step` 逐位姿一致。
+* `test_trajectory.py`：**swept 稠密轨迹与上报位姿/指令/步数完全对齐、
+  首尾相接可复现**、大跨度记录含中间扫过点、**保留上限 FIFO 丢弃最旧**
+  （limit/dropped/total 语义）、plan/reset 清空、多会话缓冲隔离、上限校验。
+* `test_rehearse.py`：**预演结论可复现**、**不改会话位姿/步数/状态/轨迹**、
+  跨墙路线给出 failure_index/failure_step 与近零净空、预算不足报障、
+  批量调参结论稳定、**预演大地图期间其它会话正常推进（不互斥）**、
+  大图预演及时返回、各类非法输入拒绝。
+* `test_advance_api.py`：三个新端点的 HTTP 接线、advance 幂等与 409 冲突、
+  非法输入 422、未规划 409、不存在会话 404、`trajectory_limit` 创建选项。

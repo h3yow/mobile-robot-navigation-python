@@ -134,11 +134,54 @@ class TrajectoryTracker:
     def advance(self, pose: Pose, cmd: Twist) -> Pose:
         """按 dt 做一阶积分（差速模型），角度归一化到 [-pi, pi]。"""
         dt = self.params.dt
-        return Pose(
-            x=pose.x + cmd.v * math.cos(pose.theta) * dt,
-            y=pose.y + cmd.v * math.sin(pose.theta) * dt,
-            theta=_wrap_angle(pose.theta + cmd.omega * dt),
-        )
+        return integrate_pose(pose, cmd, dt)
 
     def at_goal(self, pose: Pose, goal: Point) -> bool:
         return math.hypot(goal.x - pose.x, goal.y - pose.y) <= self.params.goal_tolerance
+
+
+def integrate_pose(pose: Pose, cmd: Twist, dt: float) -> Pose:
+    """差速模型积分（恒定 v/omega 的精确圆弧，直线为特例），角度归一化。"""
+    theta_f = _wrap_angle(pose.theta + cmd.omega * dt)
+    if abs(cmd.omega) < 1e-12:
+        return Pose(
+            x=pose.x + cmd.v * math.cos(pose.theta) * dt,
+            y=pose.y + cmd.v * math.sin(pose.theta) * dt,
+            theta=theta_f,
+        )
+    # 绕瞬时圆心 (cx, cy) 转动角度 omega*dt
+    radius = cmd.v / cmd.omega
+    cx = pose.x - radius * math.sin(pose.theta)
+    cy = pose.y + radius * math.cos(pose.theta)
+    return Pose(
+        x=cx + radius * math.sin(theta_f),
+        y=cy - radius * math.cos(theta_f),
+        theta=theta_f,
+    )
+
+
+def arc_poses(
+    pose: Pose,
+    cmd: Twist,
+    dt: float,
+    spacing: float,
+    *,
+    include_start: bool = True,
+) -> list[Pose]:
+    """采样一条指令在 dt 内扫过的位姿序列（恒 v/omega 的圆弧，直线为特例）。
+
+    相邻采样点的机器人中心弦长不超过 spacing，因此用这些点做间隔 <= spacing
+    的足迹复核即可保证整段运动不穿障（含大步长/薄墙场景）。
+    include_start=False 时不返回起点，便于调用方把起点与上段终点去重。
+    """
+    travel = abs(cmd.v) * dt
+    # 平移采样按弦长 spacing 控制；纯原地转向时位置不变，无需多点
+    n = max(1, math.ceil(travel / spacing)) if travel > 0 else 1
+    out: list[Pose] = []
+    start_i = 0 if include_start else 1
+    for i in range(start_i, n + 1):
+        f = i / n
+        out.append(
+            pose if f <= 0.0 else integrate_pose(pose, cmd, dt * f)
+        )
+    return out

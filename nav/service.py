@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 import uuid
@@ -22,9 +23,11 @@ from .errors import (
     InvalidInputError,
     SessionExpiredError,
     SessionNotFoundError,
+    SessionStateError,
 )
 from .grid import OccupancyGrid
 from .models import (
+    AdvanceResult,
     ControllerParams,
     PlannerParams,
     Point,
@@ -33,7 +36,8 @@ from .models import (
     SessionSnapshot,
     StepResult,
 )
-from .session import NavigationSession
+from .rehearse import rehearse
+from .session import DEFAULT_TRAJECTORY_LIMIT, NavigationSession
 
 _DEFAULT_LIMITS = dict(
     max_v=1.0, min_v=0.0, max_omega=1.5, max_curvature=2.0,
@@ -112,6 +116,22 @@ def _build_controller(body: dict) -> ControllerParams:
     )
 
 
+def _build_trajectory_limit(body: dict) -> int:
+    raw = body.get("trajectory_limit", DEFAULT_TRAJECTORY_LIMIT)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        try:
+            raw = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise InvalidInputError(
+                "trajectory_limit 必须为整数", {"value": body.get("trajectory_limit")}
+            ) from exc
+    if raw < 1:
+        raise InvalidInputError(
+            "trajectory_limit 必须 >= 1", {"value": raw}
+        )
+    return raw
+
+
 def _parse_pose(d: object, name: str) -> Pose:
     d = _require_object(d, name)
     try:
@@ -181,10 +201,12 @@ class NavigationService:
             limits = _build_limits(body)
             planner_params = _build_planner(body)
             controller_params = _build_controller(body)
+            trajectory_limit = _build_trajectory_limit(body)
             now = time.time()
             sid = uuid.uuid4().hex
             sess = NavigationSession(
-                sid, grid, limits, planner_params, controller_params, now
+                sid, grid, limits, planner_params, controller_params, now,
+                trajectory_limit=trajectory_limit,
             )
             self._sessions[sid] = sess
             snap = sess.snapshot(now)
@@ -249,6 +271,120 @@ class NavigationService:
             with self._lock:
                 self._idempotent[idempotency_key] = (fingerprint, out)
         return out
+
+    def advance_session(
+        self,
+        session_id: str,
+        payload: dict | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        """一次调用内按指定时长连续推进（可带动态障碍与临时速度上限）。"""
+        body = payload or {}
+        body = _require_object(body, "请求体")
+        fingerprint = f"advance:{session_id}:{_stable_body(body)}"
+        now = time.time()
+        sess = self._get_live(session_id, now)
+
+        with self._lock:
+            if idempotency_key is not None:
+                hit = self._idempotent.get(idempotency_key)
+                if hit is not None:
+                    fp, cached = hit
+                    if fp != fingerprint:
+                        raise IdempotencyConflictError(
+                            "同一 Idempotency-Key 对应不同请求体",
+                            {"idempotency_key": idempotency_key},
+                        )
+                    return cached
+
+        if "duration" not in body:
+            raise InvalidInputError("advance 需要 duration 字段（模拟秒数）")
+        try:
+            duration = float(body["duration"])
+        except (TypeError, ValueError) as exc:
+            raise InvalidInputError("duration 必须为数值（秒）") from exc
+        dt = _optional_positive_float(body, "dt")
+        max_v = _optional_positive_float(body, "max_v")
+
+        with sess.lock:
+            rects = body.get("dynamic_obstacles")
+            if rects is not None:
+                sess.update_dynamic_obstacles(rects, now)
+            result = sess.advance(duration, now, dt=dt, max_v=max_v)
+            snap = sess.snapshot(now)
+        out = {
+            "session": _snapshot_dict(snap),
+            "advance": _advance_dict(result),
+        }
+        if idempotency_key is not None:
+            with self._lock:
+                self._idempotent[idempotency_key] = (fingerprint, out)
+        return out
+
+    def get_trajectory(self, session_id: str) -> dict:
+        """查询会话当前保留的执行轨迹（只读，不改变会话状态）。"""
+        now = time.time()
+        sess = self._get_live(session_id, now)
+        with sess.lock:
+            data = sess.get_trajectory()
+            snap = sess.snapshot(now)
+        data["session"] = _snapshot_dict(snap)
+        return data
+
+    def rehearse_session(self, session_id: str, payload: dict | None = None) -> dict:
+        """只读预演：不改会话状态，不与会话推进互斥。
+
+        route 缺省用会话当前规划路线；start_pose 缺省用当前位姿；
+        map 缺省用会话当前有效栅格（含最近一次动态障碍）。
+        """
+        body = _require_object(payload or {}, "请求体")
+        now = time.time()
+        sess = self._get_live(session_id, now)
+        # 只在会话锁内取一份不可变/独立副本，随后释放锁做计算，
+        # 因此预演不阻塞同一会话或其它会话的推进与查询。
+        with sess.lock:
+            if sess.pose is None or sess.goal is None:
+                raise SessionStateError(
+                    "会话尚未成功规划，无法预演（请先 plan 或显式提供 route/start）"
+                )
+            grid = sess.effective_grid
+            current_path = list(sess.path)
+            current_pose = sess.pose
+            limits = sess.limits
+            planner_params = sess.planner_params
+            controller_params = sess.controller_params
+            before = sess.snapshot(now)
+
+        route_raw = body.get("route")
+        if route_raw is None:
+            route = current_path
+        else:
+            if not isinstance(route_raw, (list, tuple)) or not route_raw:
+                raise InvalidInputError("route 必须为非空数组")
+            route = [_parse_point(p, "route") for p in route_raw]
+
+        start_raw = body.get("start")
+        start_pose = (
+            _parse_pose(start_raw, "start") if start_raw is not None
+            else Pose(current_pose.x, current_pose.y, current_pose.theta)
+        )
+        duration = _optional_positive_float(body, "duration")
+        dt = _optional_positive_float(body, "dt")
+        max_v = _optional_positive_float(body, "max_v")
+        max_microsteps = body.get("max_microsteps", 20000)
+        if isinstance(max_microsteps, bool) or not isinstance(max_microsteps, int):
+            raise InvalidInputError("max_microsteps 必须为正整数")
+
+        report = rehearse(
+            grid, route, start_pose, limits, planner_params, controller_params,
+            duration=duration, dt=dt, max_v=max_v,
+            max_microsteps=max_microsteps,
+        )
+        return {
+            "report": _report_dict(report),
+            "session_observed": _snapshot_dict(before),
+            "note": "预演为只读计算，未修改会话状态；session_observed 为预演开始时快照",
+        }
 
     def replan_session(self, session_id: str) -> dict:
         now = time.time()
@@ -325,4 +461,45 @@ def _step_dict(r: StepResult) -> dict:
         "arrived": r.arrived,
         "blocked": r.blocked,
         "note": r.note,
+        "elapsed": r.elapsed,
     }
+
+
+def _advance_dict(r: AdvanceResult) -> dict:
+    return {
+        "status": r.status.value,
+        "pose": {"x": r.pose.x, "y": r.pose.y, "theta": r.pose.theta},
+        "requested_duration": r.requested_duration,
+        "simulated_duration": r.simulated_duration,
+        "steps_executed": r.steps_executed,
+        "completed": r.completed,
+        "arrived": r.arrived,
+        "blocked": r.blocked,
+        "reason": r.reason,
+        "results": [_step_dict(x) for x in r.results],
+    }
+
+
+def _report_dict(rep) -> dict:
+    return {
+        "feasible": rep.feasible,
+        "completed": rep.completed,
+        "duration": rep.duration,
+        "steps": rep.steps,
+        "min_clearance": rep.min_clearance,
+        "failure_index": rep.failure_index,
+        "failure_step": rep.failure_step,
+        "reason": rep.reason,
+    }
+
+
+def _optional_positive_float(body: dict, key: str) -> float | None:
+    if key not in body or body[key] is None:
+        return None
+    raw = body[key]
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise InvalidInputError(f"{key} 必须为数值", {"value": raw})
+    val = float(raw)
+    if not math.isfinite(val) or val <= 0:
+        raise InvalidInputError(f"{key} 必须为有限正数", {"value": val})
+    return val

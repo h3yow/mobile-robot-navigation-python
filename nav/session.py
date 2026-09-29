@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import math
 import threading
-import time
+from collections import deque
 
-from .controller import TrajectoryTracker
+from .controller import TrajectoryTracker, arc_poses, integrate_pose
 from .errors import (
+    InvalidInputError,
     SessionStateError,
 )
 from .grid import OccupancyGrid, rasterize_rect
 from .models import (
+    AdvanceResult,
     ControllerParams,
     PlannerParams,
     Point,
@@ -25,8 +27,57 @@ from .models import (
     SessionSnapshot,
     SessionStatus,
     StepResult,
+    TrajectoryRecord,
+    Twist,
 )
 from .planner import GridPlanner
+
+# ---- 长时推进/轨迹相关常量 ----
+# 单条轨迹记录中扫掠位姿的采样数上限（采样再密也只保留这么多点做回查）
+MAX_SWIPT_POINTS_PER_RECORD = 256
+# advance 单次允许模拟的最大时长（秒）与最大微步数（防误用导致长时间占用）
+MAX_ADVANCE_DURATION = 60.0
+MAX_MICROSTEPS = 20000
+# 轨迹记录默认保留条数；超出后丢弃最旧记录（FIFO 环形缓冲）
+DEFAULT_TRAJECTORY_LIMIT = 2000
+
+
+class AdvanceParams:
+    """一次 advance 的运行参数（仅本次调用生效，不改会话默认配置）。"""
+
+    __slots__ = ("duration", "dt", "max_v")
+
+    def __init__(
+        self,
+        duration: float,
+        dt: float | None = None,
+        max_v: float | None = None,
+    ) -> None:
+        if not isinstance(duration, (int, float)) or isinstance(duration, bool):
+            raise InvalidInputError("duration 必须为数值", {"value": repr(duration)})
+        duration = float(duration)
+        if not math.isfinite(duration) or duration <= 0:
+            raise InvalidInputError("duration 必须为有限正数（秒）", {"value": duration})
+        if duration > MAX_ADVANCE_DURATION:
+            raise InvalidInputError(
+                f"duration 不能超过 {MAX_ADVANCE_DURATION:g} 秒",
+                {"value": duration, "max": MAX_ADVANCE_DURATION},
+            )
+        if dt is not None:
+            if not isinstance(dt, (int, float)) or isinstance(dt, bool):
+                raise InvalidInputError("dt 必须为数值", {"value": repr(dt)})
+            dt = float(dt)
+            if not math.isfinite(dt) or dt <= 0:
+                raise InvalidInputError("dt 必须为有限正数（秒）", {"value": dt})
+        if max_v is not None:
+            if not isinstance(max_v, (int, float)) or isinstance(max_v, bool):
+                raise InvalidInputError("max_v 必须为数值", {"value": repr(max_v)})
+            max_v = float(max_v)
+            if not math.isfinite(max_v) or max_v <= 0:
+                raise InvalidInputError("max_v 必须为有限正数", {"value": max_v})
+        self.duration = duration
+        self.dt = dt
+        self.max_v = max_v
 
 
 class NavigationSession:
@@ -40,10 +91,16 @@ class NavigationSession:
         planner_params: PlannerParams,
         controller_params: ControllerParams,
         created_at: float,
+        trajectory_limit: int = DEFAULT_TRAJECTORY_LIMIT,
     ) -> None:
+        if not isinstance(trajectory_limit, int) or trajectory_limit < 1:
+            raise InvalidInputError(
+                "trajectory_limit 必须为 >=1 的整数", {"value": trajectory_limit}
+            )
         self.id = session_id
         self.base_grid = grid
         self.limits = limits
+        self.trajectory_limit = trajectory_limit
         # 规划安全余量：用户显式膨胀格数 + 足迹半径折算格数（向上取整）。
         # 规划路径据此与障碍保持至少一个外接半径的间距；
         # 跟踪阶段的切角安全由 max_curvature 速度包络 + 逐步足迹复核共同保证。
@@ -86,6 +143,12 @@ class NavigationSession:
         self.previous_v = 0.0
         self.dynamic_rects: list[tuple[float, float, float, float]] = []
         self.effective_grid: OccupancyGrid = grid
+        # 执行轨迹环形缓冲：只保留最近 trajectory_limit 条微步记录，
+        # 超出后丢弃最旧记录；不同会话各持一份，互不影响。
+        self.trajectory: deque[TrajectoryRecord] = deque(
+            maxlen=trajectory_limit
+        )
+        self.trajectory_dropped = 0
         self.last_note = "会话已创建，等待规划"
         self.created_at = created_at
         self.updated_at = created_at
@@ -98,6 +161,7 @@ class NavigationSession:
         planner_params: PlannerParams,
         controller_params: ControllerParams,
         now: float,
+        trajectory_limit: int = DEFAULT_TRAJECTORY_LIMIT,
     ) -> "NavigationSession":
         return cls(
             session_id="",
@@ -106,6 +170,7 @@ class NavigationSession:
             planner_params=planner_params,
             controller_params=controller_params,
             created_at=now,
+            trajectory_limit=trajectory_limit,
         )
 
     # ------------------------------------------------------------------
@@ -158,6 +223,7 @@ class NavigationSession:
             self.path_index = 0
             self.step_count = 0
             self.previous_v = 0.0
+            self._clear_trajectory()
             self.status = SessionStatus.READY
             self.last_note = f"规划成功：{len(path)} 个路径点"
             self._touch(now)
@@ -183,112 +249,362 @@ class NavigationSession:
 
     # ------------------------------------------------------------------
     def step(self, now: float) -> StepResult:
-        """推进一步。
-
-        流程（整步在会话锁内完成，杜绝错序与状态撕裂）：
-          1. 重建有效栅格（纳入最新动态障碍）；
-          2. 若当前位姿已被障碍覆盖（机器人被困在障碍内）-> BLOCKED，零速；
-          3. 检查剩余路径通畅性；被挡则尝试重规划；
-             重规划失败（不可达/超时）-> BLOCKED，零速，状态可继续（环境变化后再 step 即恢复）；
-          4. 跟踪器选前视点、算受约束指令、积分；
-          5. 积分后位姿必须无碰撞，否则拒绝该运动（零速，BLOCKED）；
-          6. 到达目标 -> ARRIVED。
-        """
+        """推进一步（默认 dt 与会话速度上限）。"""
         with self.lock:
             if self.pose is None or self.goal is None or not self.path:
                 raise SessionStateError("会话尚未成功规划，无法步进")
-
             self._rebuild_effective_grid()
-            note_parts: list[str] = []
+            return self._microstep(
+                self.controller_params.dt, None, now
+            )
 
-            # 1) 当前位姿安全性
-            if self.effective_grid.footprint_blocked(
-                self.pose.x, self.pose.y, self.limits.footprint_radius
-            ):
+    def _collision_spacing(self) -> float:
+        """扫掠碰撞复核的采样间距：1/4 栅格（上限 0.2m，避免细分辨率下过密）。"""
+        return min(self.base_grid.resolution * 0.25, 0.2)
+
+    def _arc_collides(
+        self, pose: Pose, cmd: Twist, duration: float, spacing: float
+    ) -> bool:
+        """检查一条恒定指令圆弧在 duration 内是否触障/越界。
+
+        以间距 <= spacing 采样扫掠位姿，并对每个采样点用
+        ``footprint_radius + spacing/2`` 的膨胀半径复核，
+        因此相邻采样之间的“隧穿”缝隙也被覆盖，薄墙/窄通道不会漏检。
+        """
+        r_safe = self.limits.footprint_radius + spacing * 0.5
+        poses = arc_poses(pose, cmd, duration, spacing)
+        for p in poses:
+            if self.effective_grid.footprint_blocked(p.x, p.y, r_safe):
+                return True
+        return False
+
+    def _microstep(
+        self,
+        dt: float,
+        max_v_override: float | None,
+        now: float,
+    ) -> StepResult:
+        """执行一个微步（调用方须已重建有效栅格并持有会话锁）。
+
+        与单步相同的安全流程，但允许指定 dt 与临时速度上限：
+          1. 当前位姿安全性；
+          2. 路径通畅性 + 自动重规划；
+          3. 到点判定；
+          4. 跟踪器算受约束指令（含 dt/速度上限）；
+          5. 整段圆弧扫掠碰撞复核；若全步走不下则二分取最大可行部分，
+             任何部分都走不下则零速 BLOCKED（原地停住、状态保留）；
+          6. 到达目标 -> ARRIVED；成功运动写入轨迹缓冲。
+        """
+        note_parts: list[str] = []
+
+        # 本次微步生效的参数/约束（不写回会话默认配置）
+        limits = self.limits
+        if max_v_override is not None and max_v_override != self.limits.max_v:
+            limits = RobotLimits(
+                max_v=max_v_override,
+                min_v=self.limits.min_v,
+                max_omega=self.limits.max_omega,
+                max_curvature=self.limits.max_curvature,
+                max_acc=self.limits.max_acc,
+                footprint_radius=self.limits.footprint_radius,
+            )
+        cparams = ControllerParams(
+            k_linear=self.controller_params.k_linear,
+            k_angular=self.controller_params.k_angular,
+            goal_tolerance=self.controller_params.goal_tolerance,
+            lookahead_cells=self.controller_params.lookahead_cells,
+            dt=dt,
+        )
+        tracker = TrajectoryTracker(limits, cparams)
+
+        # 1) 当前位姿安全性
+        if self.effective_grid.footprint_blocked(
+            self.pose.x, self.pose.y, self.limits.footprint_radius
+        ):
+            self.status = SessionStatus.BLOCKED
+            self.last_note = "当前位姿已被障碍占据，无法运动"
+            self._touch(now)
+            return StepResult(
+                pose=self.pose, cmd=_zero_twist(), replanned=False,
+                arrived=False, blocked=True, note=self.last_note,
+            )
+
+        # 2) 路径通畅性检查 + 自动重规划
+        replanned = False
+        planner = GridPlanner(self.effective_grid, self.planner_params)
+        blocked_idx = planner.is_path_clear(
+            self.path, self.limits.footprint_radius
+        )
+        if blocked_idx >= 0:
+            note_parts.append(f"路径在第 {blocked_idx} 段被动态障碍阻挡")
+            try:
+                new_path = planner.plan(
+                    Point(self.pose.x, self.pose.y), self.goal
+                )
+                self.path = new_path
+                self.path_index = 0
+                replanned = True
+                note_parts.append(f"自动重规划成功（{len(new_path)} 点）")
+            except Exception as exc:  # 不可达 / 超时 / 起终点非法
                 self.status = SessionStatus.BLOCKED
-                self.last_note = "当前位姿已被障碍占据，无法运动"
+                self.last_note = (
+                    f"{'; '.join(note_parts)}；重规划失败：{exc.message if hasattr(exc, 'message') else exc}"
+                )
                 self._touch(now)
                 return StepResult(
                     pose=self.pose, cmd=_zero_twist(), replanned=False,
                     arrived=False, blocked=True, note=self.last_note,
                 )
 
-            # 2) 路径通畅性检查 + 自动重规划
-            replanned = False
-            planner = GridPlanner(self.effective_grid, self.planner_params)
-            blocked_idx = planner.is_path_clear(
-                self.path, self.limits.footprint_radius
-            )
-            if blocked_idx >= 0:
-                note_parts.append(f"路径在第 {blocked_idx} 段被动态障碍阻挡")
-                try:
-                    new_path = planner.plan(
-                        Point(self.pose.x, self.pose.y), self.goal
-                    )
-                    self.path = new_path
-                    self.path_index = 0
-                    replanned = True
-                    note_parts.append(f"自动重规划成功（{len(new_path)} 点）")
-                except Exception as exc:  # 不可达 / 超时 / 起终点非法
-                    self.status = SessionStatus.BLOCKED
-                    self.last_note = (
-                        f"{'; '.join(note_parts)}；重规划失败：{exc.message if hasattr(exc, 'message') else exc}"
-                    )
-                    self._touch(now)
-                    return StepResult(
-                        pose=self.pose, cmd=_zero_twist(), replanned=False,
-                        arrived=False, blocked=True, note=self.last_note,
-                    )
-
-            # 3) 到达判定（在执行运动之前先看是否已经在终点容差内）
-            if self.tracker.at_goal(self.pose, self.goal):
-                self.status = SessionStatus.ARRIVED
-                self.last_note = "已到达目标"
-                self._touch(now)
-                return StepResult(
-                    pose=self.pose, cmd=_zero_twist(), replanned=replanned,
-                    arrived=True, blocked=False, note=self.last_note,
-                )
-
-            # 4) 跟踪控制
-            aim, new_idx = self.tracker.find_aim_point(
-                self.pose, self.path, self.path_index
-            )
-            self.path_index = new_idx
-            cmd = self.tracker.compute_command(self.pose, aim, self.previous_v)
-            next_pose = self.tracker.advance(self.pose, cmd)
-
-            # 5) 运动后碰撞复核：任何时刻不得穿越障碍
-            if self.effective_grid.footprint_blocked(
-                next_pose.x, next_pose.y, self.limits.footprint_radius
-            ):
-                self.status = SessionStatus.BLOCKED
-                self.last_note = "下一步预测位姿触障，拒绝执行该速度指令"
-                self._touch(now)
-                return StepResult(
-                    pose=self.pose, cmd=_zero_twist(), replanned=replanned,
-                    arrived=False, blocked=True, note=self.last_note,
-                )
-
-            self.pose = next_pose
-            self.previous_v = cmd.v
-            self.step_count += 1
-            arrived = self.tracker.at_goal(next_pose, self.goal)
-            self.status = (
-                SessionStatus.ARRIVED if arrived else SessionStatus.RUNNING
-            )
-            note_parts.append(
-                f"步进 {self.step_count}：v={cmd.v:.3f} omega={cmd.omega:.3f} "
-                f"瞄准路径点[{self.path_index}]"
-            )
-            if arrived:
-                note_parts.append("已到达目标")
-            self.last_note = "；".join(note_parts)
+        # 3) 到达判定
+        if tracker.at_goal(self.pose, self.goal):
+            self.status = SessionStatus.ARRIVED
+            self.last_note = "已到达目标"
             self._touch(now)
             return StepResult(
-                pose=next_pose, cmd=cmd, replanned=replanned,
-                arrived=arrived, blocked=False, note=self.last_note,
+                pose=self.pose, cmd=_zero_twist(), replanned=replanned,
+                arrived=True, blocked=False, note=self.last_note,
             )
+
+        # 4) 跟踪控制
+        aim, new_idx = tracker.find_aim_point(
+            self.pose, self.path, self.path_index
+        )
+        self.path_index = new_idx
+        cmd = tracker.compute_command(self.pose, aim, self.previous_v)
+
+        # 5) 整段扫掠碰撞复核（不只是终点）
+        spacing = self._collision_spacing()
+        if not self._arc_collides(self.pose, cmd, dt, spacing):
+            frac = 1.0
+        else:
+            # 全步走不下：二分求最大可行时长比例，能走多少走多少
+            frac = self._max_safe_fraction(self.pose, cmd, dt, spacing)
+
+        if frac <= 0.0:
+            self.status = SessionStatus.BLOCKED
+            self.last_note = (
+                "预测运动轨迹触障/越界（含完整扫掠段复核），拒绝该速度指令，原地停住"
+            )
+            if replanned:
+                self.last_note = "；".join(note_parts + [self.last_note])
+            self._touch(now)
+            return StepResult(
+                pose=self.pose, cmd=_zero_twist(), replanned=replanned,
+                arrived=False, blocked=True, note=self.last_note,
+            )
+
+        move_dt = dt * frac
+        pose_before = self.pose
+        next_pose = integrate_pose(self.pose, cmd, move_dt)
+        partial = frac < 1.0
+
+        self.pose = next_pose
+        self.previous_v = cmd.v
+        self.step_count += 1
+        arrived = tracker.at_goal(next_pose, self.goal)
+        if arrived:
+            self.status = SessionStatus.ARRIVED
+        elif partial:
+            self.status = SessionStatus.BLOCKED
+        else:
+            self.status = SessionStatus.RUNNING
+
+        # 轨迹记录（只有真实发生了运动才产生一条，与 step_count 对齐）
+        self._record_motion(pose_before, next_pose, cmd, move_dt, spacing)
+
+        note_parts.append(
+            f"步进 {self.step_count}：v={cmd.v:.3f} omega={cmd.omega:.3f} "
+            f"dt={move_dt:.3f}s 瞄准路径点[{self.path_index}]"
+        )
+        if partial:
+            note_parts.append(
+                f"整段 {dt:.3f}s 中仅前 {frac * 100:.1f}%（{move_dt:.3f}s）"
+                "可安全通过，随后轨迹触障/越界，已在该位置停住"
+            )
+        if arrived:
+            note_parts.append("已到达目标")
+        self.last_note = "；".join(note_parts)
+        self._touch(now)
+        return StepResult(
+            pose=next_pose, cmd=cmd, replanned=replanned,
+            arrived=arrived, blocked=partial, note=self.last_note,
+            elapsed=move_dt,
+        )
+
+    def _max_safe_fraction(
+        self, pose: Pose, cmd: Twist, dt: float, spacing: float
+    ) -> float:
+        """二分求 [0,1] 内使整段圆弧无碰撞的最大时长比例。
+
+        若任一无穷小运动都触障（f->0 仍碰撞），返回 0.0。
+        """
+        # 先看“趋近于 0”的一小步是否安全
+        tiny = 1e-3
+        if self._arc_collides(pose, cmd, dt * tiny, spacing):
+            return 0.0
+        lo, hi = tiny, 1.0
+        for _ in range(24):
+            mid = (lo + hi) * 0.5
+            if self._arc_collides(pose, cmd, dt * mid, spacing):
+                hi = mid
+            else:
+                lo = mid
+        return lo
+
+    def _record_motion(
+        self,
+        start_pose: Pose,
+        end_pose: Pose,
+        cmd: Twist,
+        move_dt: float,
+        spacing: float,
+    ) -> None:
+        """把一次已执行的微步写入轨迹环形缓冲。"""
+        travel = abs(cmd.v) * move_dt
+        if travel <= 0:
+            swept = [start_pose, end_pose]
+        else:
+            # 存储采样数封顶：碰撞复核用细 spacing，记录点可更粗，
+            # 但始终包含起点、终点与中间扫过位置
+            store_spacing = max(
+                spacing, travel / (MAX_SWIPT_POINTS_PER_RECORD - 1)
+            )
+            swept = arc_poses(
+                start_pose, cmd, move_dt, store_spacing
+            )
+        record = TrajectoryRecord(
+            step=self.step_count,
+            pose=end_pose,
+            cmd=cmd,
+            swept=swept,
+            dt=move_dt,
+        )
+        if len(self.trajectory) >= self.trajectory_limit:
+            self.trajectory_dropped += 1
+        self.trajectory.append(record)
+
+    def _clear_trajectory(self) -> None:
+        self.trajectory.clear()
+        self.trajectory_dropped = 0
+
+    def advance(
+        self,
+        duration: float,
+        now: float,
+        *,
+        dt: float | None = None,
+        max_v: float | None = None,
+    ) -> AdvanceResult:
+        """在一次调用内模拟最多 duration 秒的连续运动。
+
+        - dt：本次推进使用的微步间隔（秒），缺省用会话默认 controller.dt；
+        - max_v：本次推进临时速度上限，缺省用会话 limits.max_v；
+          两者只影响本次调用，不改动会话配置。
+        - 每个微步都做完整的扫掠碰撞/越界/约束复核：
+          能走多少走多少（部分微步也会停在安全位置），走不动就原地停住。
+        - 被挡住/到达后会话状态完整保留，可继续 advance / step / replan。
+        """
+        params = AdvanceParams(duration, dt=dt, max_v=max_v)
+        with self.lock:
+            if self.pose is None or self.goal is None or not self.path:
+                raise SessionStateError("会话尚未成功规划，无法推进")
+
+            step_dt = params.dt or self.controller_params.dt
+            remaining = params.duration
+            results: list[StepResult] = []
+            executed = 0.0
+            n_micro = 0
+            reason = ""
+            start_pose = self.pose
+            stop_blocked = False
+
+            while remaining > 1e-12 and n_micro < MAX_MICROSTEPS:
+                self._rebuild_effective_grid()
+                cur_dt = min(step_dt, remaining)
+                r = self._microstep(cur_dt, params.max_v, now)
+                results.append(r)
+                n_micro += 1
+                if r.arrived:
+                    executed += r.elapsed
+                    reason = "已到达目标"
+                    remaining = 0.0
+                    break
+                if r.blocked:
+                    executed += r.elapsed
+                    stop_blocked = True
+                    if r.elapsed <= 0.0 and _same_pose(r.pose, start_pose):
+                        reason = (
+                            "起始方向即被阻挡（预测轨迹触障/越界或路径不可达），"
+                            "原地停住；环境变化或重规划后可继续"
+                        )
+                    else:
+                        reason = (
+                            "推进途中剩余路线被障碍/边界阻挡，"
+                            "已在最后安全位置停住（本微步仅前半段可通行）；"
+                            "环境变化或重规划后可继续"
+                        )
+                    remaining = 0.0
+                    break
+                executed += cur_dt
+                remaining -= cur_dt
+
+            if n_micro >= MAX_MICROSTEPS and remaining > 1e-12:
+                reason = (
+                    f"达到单次推进最大微步数 {MAX_MICROSTEPS}，"
+                    "已安全模拟部分时长（可继续调用推进剩余时长）"
+                )
+            if not reason:
+                reason = f"已完整安全模拟 {params.duration:g} 秒"
+            arrived_now = bool(results and results[-1].arrived)
+            return AdvanceResult(
+                status=self.status,
+                pose=self.pose,
+                requested_duration=params.duration,
+                simulated_duration=executed,
+                steps_executed=n_micro,
+                # 到达终点即视为完成（即使时长未满）；或完整模拟完时长且未被挡
+                completed=arrived_now
+                or ((not stop_blocked) and executed + 1e-9 >= params.duration),
+                arrived=arrived_now,
+                blocked=stop_blocked,
+                reason=reason,
+                results=results,
+            )
+
+    def get_trajectory(self) -> dict:
+        """返回当前保留的执行轨迹（只读视图，调用方修改不影响会话）。
+
+        返回字段：
+          - records：每条微步一条，含 step / pose / cmd / dt / swept
+            （swept 为该微步扫过的稠密位姿，首尾相接可还原连续轨迹，
+             且 record.step 与历史 StepResult 的 step_count 一一对应）；
+          - limit：保留上限；dropped：因超限被丢弃的最旧记录条数；
+          - retained / total：当前保留/累计记录条数。
+        """
+        with self.lock:
+            records = [
+                {
+                    "step": rec.step,
+                    "pose": {
+                        "x": rec.pose.x, "y": rec.pose.y, "theta": rec.pose.theta
+                    },
+                    "cmd": {"v": rec.cmd.v, "omega": rec.cmd.omega},
+                    "dt": rec.dt,
+                    "swept": [
+                        {"x": p.x, "y": p.y, "theta": p.theta}
+                        for p in rec.swept
+                    ],
+                }
+                for rec in self.trajectory
+            ]
+            return {
+                "records": records,
+                "limit": self.trajectory_limit,
+                "dropped": self.trajectory_dropped,
+                "retained": len(records),
+                "total": self.trajectory_dropped + len(records),
+            }
 
     def reset(self, now: float) -> None:
         """清空目标与轨迹，回到 CREATED（地图与参数保留）。"""
@@ -302,6 +618,7 @@ class NavigationSession:
             self.status = SessionStatus.CREATED
             self.dynamic_rects = []
             self.effective_grid = self.base_grid
+            self._clear_trajectory()
             self.last_note = "会话已重置"
             self._touch(now)
 
@@ -323,7 +640,9 @@ class NavigationSession:
             )
 
 
-def _zero_twist():
-    from .models import Twist
-
+def _zero_twist() -> Twist:
     return Twist(v=0.0, omega=0.0)
+
+
+def _same_pose(a: Pose, b: Pose) -> bool:
+    return abs(a.x - b.x) < 1e-12 and abs(a.y - b.y) < 1e-12
