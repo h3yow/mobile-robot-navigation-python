@@ -156,6 +156,66 @@ class ControllerParams:
             raise InvalidInputError("dt 必须为正")
 
 
+@dataclass(frozen=True, slots=True)
+class TrajectorySample:
+    """一个执行微步（tick）落盘后的轨迹样本。
+
+    index 为会话内全局单调序号（等于记录该样本后的 step_count）；
+    t 为会话内累计仿真时间（秒）。advance 一次推进产生多个连续样本。
+    """
+
+    index: int
+    t: float
+    pose: Pose
+    v: float
+    omega: float
+    replanned: bool
+    blocked: bool
+    arrived: bool
+
+
+@dataclass(slots=True)
+class AdvanceResult:
+    """一次按时长推进的结果（可能只走完一部分）。
+
+    poses 为本次推进每个微步对外上报的位姿序列（含被挡住时的原地零速步），
+    与 samples 中的 pose 一一对应；completed=False 时 blocked/arrived 说明提前停止原因。
+    """
+
+    poses: list[Pose]
+    samples: list[TrajectorySample]
+    steps_requested: int
+    steps_executed: int
+    requested_duration: float
+    dt: float
+    elapsed: float
+    completed: bool
+    arrived: bool
+    blocked: bool
+    replanned: bool
+    note: str
+
+
+@dataclass(slots=True)
+class PreviewResult:
+    """只读预演结果：给定路线与运行参数，判断能否安全走完全程。
+
+    feasible=False 时 fail_index 为路线顶点下标（大概在第几个位置出问题），
+    fail_reason 取 start_blocked/path_invalid/collision/blocked/step_budget；
+    min_clearance 为全程（路线折线与实际扫掠轨迹）离障碍/边界的最近距离（米）。
+    """
+
+    feasible: bool
+    ticks_simulated: int
+    min_clearance: float
+    min_clearance_point: Point | None
+    clearance_capped: bool
+    fail_index: int | None
+    fail_reason: str | None
+    fail_pose: Pose | None
+    note: str
+
+
 @dataclass(slots=True)
 class StepResult:
     """单次步进结果。"""
@@ -183,3 +243,9 @@ class SessionSnapshot:
     last_note: str
     created_at: float
     updated_at: float
+    sim_time: float = 0.0
+    trajectory_length: int = 0
+    trajectory_total: int = 0
+    trajectory_dropped: int = 0
+    trajectory_capacity: int = 0
+    trajectory_truncated: bool = False

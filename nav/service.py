@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 import uuid
@@ -47,6 +48,13 @@ _DEFAULT_CONTROLLER = dict(
     k_linear=1.0, k_angular=2.0, goal_tolerance=0.05,
     lookahead_cells=0.6, dt=0.1,
 )
+
+# 按时长推进/轨迹保留的默认值与硬上限
+DEFAULT_TRAJECTORY_CAPACITY = 2000
+MAX_TRAJECTORY_CAPACITY = 100_000
+MAX_ADVANCE_DURATION = 60.0          # 单次 advance 最多模拟 60 秒
+DEFAULT_PREVIEW_MAX_TICKS = 20_000   # 预演默认微步预算
+MAX_PREVIEW_TICKS = 200_000
 
 
 def _require_object(payload: object, name: str) -> dict:
@@ -128,6 +136,32 @@ def _parse_point(d: object, name: str) -> Point:
         raise InvalidInputError(f"{name} 需要数值字段 x,y") from exc
 
 
+def _parse_trajectory_capacity(body: dict) -> int:
+    raw = body.get("trajectory_capacity", DEFAULT_TRAJECTORY_CAPACITY)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise InvalidInputError(
+            "trajectory_capacity 必须为正整数", {"value": raw}
+        )
+    if raw < 1 or raw > MAX_TRAJECTORY_CAPACITY:
+        raise InvalidInputError(
+            f"trajectory_capacity 必须在 [1,{MAX_TRAJECTORY_CAPACITY}] 内",
+            {"value": raw},
+        )
+    return int(raw)
+
+
+def _number(body: dict, key: str, *, positive: bool = True) -> float | None:
+    if key not in body or body[key] is None:
+        return None
+    v = body[key]
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise InvalidInputError(f"{key} 必须为数值", {"value": v})
+    v = float(v)
+    if not math.isfinite(v) or (positive and v <= 0):
+        raise InvalidInputError(f"{key} 必须为有限正数", {"value": v})
+    return v
+
+
 def _stable_body(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -181,10 +215,12 @@ class NavigationService:
             limits = _build_limits(body)
             planner_params = _build_planner(body)
             controller_params = _build_controller(body)
+            traj_cap = _parse_trajectory_capacity(body)
             now = time.time()
             sid = uuid.uuid4().hex
             sess = NavigationSession(
-                sid, grid, limits, planner_params, controller_params, now
+                sid, grid, limits, planner_params, controller_params, now,
+                trajectory_capacity=traj_cap,
             )
             self._sessions[sid] = sess
             snap = sess.snapshot(now)
@@ -250,6 +286,96 @@ class NavigationService:
                 self._idempotent[idempotency_key] = (fingerprint, out)
         return out
 
+    def advance_session(
+        self,
+        session_id: str,
+        payload: dict | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict:
+        """一次按时长安全推进：可选 duration/dt/max_v/dynamic_obstacles。"""
+        body = _require_object(payload or {}, "请求体")
+        fingerprint = f"advance:{session_id}:{_stable_body(body)}"
+        now = time.time()
+        sess = self._get_live(session_id, now)
+
+        with self._lock:
+            if idempotency_key is not None:
+                hit = self._idempotent.get(idempotency_key)
+                if hit is not None:
+                    fp, cached = hit
+                    if fp != fingerprint:
+                        raise IdempotencyConflictError(
+                            "同一 Idempotency-Key 对应不同请求体",
+                            {"idempotency_key": idempotency_key},
+                        )
+                    return cached
+
+        duration = _number(body, "duration")
+        if duration is None:
+            raise InvalidInputError("advance 必须提供 duration（秒）")
+        if duration > MAX_ADVANCE_DURATION:
+            raise InvalidInputError(
+                f"duration 不得超过 {MAX_ADVANCE_DURATION:g} 秒",
+                {"value": duration, "max": MAX_ADVANCE_DURATION},
+            )
+        dt = _number(body, "dt")
+        max_v = _number(body, "max_v")
+
+        with sess.lock:
+            rects = body.get("dynamic_obstacles")
+            if rects is not None:
+                sess.update_dynamic_obstacles(rects, now)
+            result = sess.advance(now, duration, dt=dt, max_v=max_v)
+            snap = sess.snapshot(now)
+        out = {
+            "session": _snapshot_dict(snap),
+            "advance": _advance_dict(result),
+        }
+        if idempotency_key is not None:
+            with self._lock:
+                self._idempotent[idempotency_key] = (fingerprint, out)
+        return out
+
+    def get_trajectory_session(self, session_id: str) -> dict:
+        """查询当前保留的执行轨迹（含中间扫过位姿）与容量统计。"""
+        now = time.time()
+        sess = self._get_live(session_id, now)
+        return sess.get_trajectory(now)
+
+    def preview_session(self, session_id: str, payload: dict | None = None) -> dict:
+        """只读预演：不改任何会话状态；可自带 path/start，否则预演当前路径。"""
+        body = _require_object(payload or {}, "请求体")
+        now = time.time()
+        sess = self._get_live(session_id, now)
+
+        dt = _number(body, "dt") or sess.controller_params.dt
+        max_v = _number(body, "max_v") or sess.limits.max_v
+        max_ticks = body.get("max_ticks", DEFAULT_PREVIEW_MAX_TICKS)
+        if isinstance(max_ticks, bool) or not isinstance(max_ticks, int):
+            raise InvalidInputError("max_ticks 必须为正整数", {"value": max_ticks})
+        if max_ticks < 1 or max_ticks > MAX_PREVIEW_TICKS:
+            raise InvalidInputError(
+                f"max_ticks 必须在 [1,{MAX_PREVIEW_TICKS}] 内",
+                {"value": max_ticks},
+            )
+
+        path = None
+        start = None
+        if "path" in body and body["path"] is not None:
+            raw_path = body["path"]
+            if not isinstance(raw_path, list) or not raw_path:
+                raise InvalidInputError("path 必须为非空的点数组")
+            path = [_parse_point(p, "path[]") for p in raw_path]
+            start = (
+                _parse_pose(body["start"], "start")
+                if "start" in body and body["start"] is not None
+                else None
+            )
+        result = sess.preview(
+            path, dt=dt, max_v=max_v, max_ticks=max_ticks, start=start
+        )
+        return {"preview": _preview_dict(result)}
+
     def replan_session(self, session_id: str) -> dict:
         now = time.time()
         sess = self._get_live(session_id, now)
@@ -314,6 +440,64 @@ def _snapshot_dict(snap: SessionSnapshot) -> dict:
         "last_note": snap.last_note,
         "created_at": snap.created_at,
         "updated_at": snap.updated_at,
+        "sim_time": snap.sim_time,
+        "trajectory": {
+            "length": snap.trajectory_length,
+            "total": snap.trajectory_total,
+            "dropped": snap.trajectory_dropped,
+            "capacity": snap.trajectory_capacity,
+            "truncated": snap.trajectory_truncated,
+        },
+    }
+
+
+def _advance_dict(r) -> dict:
+    return {
+        "poses": [
+            {"x": p.x, "y": p.y, "theta": p.theta} for p in r.poses
+        ],
+        "samples": [
+            {
+                "index": s.index,
+                "t": s.t,
+                "pose": {"x": s.pose.x, "y": s.pose.y, "theta": s.pose.theta},
+                "cmd": {"v": s.v, "omega": s.omega},
+                "replanned": s.replanned,
+                "blocked": s.blocked,
+                "arrived": s.arrived,
+            }
+            for s in r.samples
+        ],
+        "steps_requested": r.steps_requested,
+        "steps_executed": r.steps_executed,
+        "requested_duration": r.requested_duration,
+        "dt": r.dt,
+        "elapsed": r.elapsed,
+        "completed": r.completed,
+        "arrived": r.arrived,
+        "blocked": r.blocked,
+        "replanned": r.replanned,
+        "note": r.note,
+    }
+
+
+def _preview_dict(r) -> dict:
+    return {
+        "feasible": r.feasible,
+        "ticks_simulated": r.ticks_simulated,
+        "min_clearance": r.min_clearance,
+        "min_clearance_point": (
+            None if r.min_clearance_point is None
+            else {"x": r.min_clearance_point.x, "y": r.min_clearance_point.y}
+        ),
+        "clearance_capped": r.clearance_capped,
+        "fail_index": r.fail_index,
+        "fail_reason": r.fail_reason,
+        "fail_pose": (
+            None if r.fail_pose is None
+            else {"x": r.fail_pose.x, "y": r.fail_pose.y, "theta": r.fail_pose.theta}
+        ),
+        "note": r.note,
     }
 
 

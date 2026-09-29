@@ -86,6 +86,7 @@ class TrajectoryTracker:
         """
         dx, dy = aim.x - pose.x, aim.y - pose.y
         distance = math.hypot(dx, dy)
+        tol = self.params.goal_tolerance
         angle_err = _wrap_angle(math.atan2(dy, dx) - pose.theta)
         dt = self.params.dt
 
@@ -120,6 +121,13 @@ class TrajectoryTracker:
         # 2) 加速度限幅
         max_dv = self.limits.max_acc * dt
         desired_v = max(previous_v - max_dv, min(previous_v + max_dv, desired_v))
+
+        # 2.5) 末端制动限速：按 v² <= 2·a·d 约束期望速度，
+        #      保证高速接近目标时能在到点容差前停住（不冲过终点/越界）。
+        brake_v = math.sqrt(
+            max(0.0, 2.0 * self.limits.max_acc * max(0.0, distance - tol))
+        )
+        desired_v = min(desired_v, brake_v)
 
         # 3) 全包络限幅（速度/角速度/曲率）
         v, omega = self.limits.clamp_command(desired_v, omega)
