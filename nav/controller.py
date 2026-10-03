@@ -160,6 +160,46 @@ def integrate_pose(pose: Pose, cmd: Twist, dt: float) -> Pose:
     )
 
 
+def integrate_pose_euler(pose: Pose, cmd: Twist, dt: float) -> Pose:
+    """老版一阶积分（升级前 step 使用的运动学）：沿当前朝向直线平移 dt，
+    角度在末端一次性更新并归一化。
+
+    仅供 legacy 单步（step）路径使用，以保证不传新参数时位姿序列与
+    升级前完全一致；advance/预演使用精确圆弧积分 integrate_pose。
+    """
+    return Pose(
+        x=pose.x + cmd.v * math.cos(pose.theta) * dt,
+        y=pose.y + cmd.v * math.sin(pose.theta) * dt,
+        theta=_wrap_angle(pose.theta + cmd.omega * dt),
+    )
+
+
+def euler_poses(
+    pose: Pose,
+    cmd: Twist,
+    dt: float,
+    spacing: float,
+    *,
+    include_start: bool = True,
+) -> list[Pose]:
+    """按老版一阶积分模型采样 dt 内扫过的位姿序列（直线平移为特例）。
+
+    与 arc_poses 同构，但运动模型为 integrate_pose_euler：中间点保持起始
+    朝向做直线平移，终点朝向为归一化后的 theta + omega*dt。
+    用于 legacy step 的轨迹记录，使 swept[-1] 与上报位姿严格一致。
+    """
+    travel = abs(cmd.v) * dt
+    n = max(1, math.ceil(travel / spacing)) if travel > 0 else 1
+    out: list[Pose] = []
+    start_i = 0 if include_start else 1
+    for i in range(start_i, n + 1):
+        f = i / n
+        out.append(
+            pose if f <= 0.0 else integrate_pose_euler(pose, cmd, dt * f)
+        )
+    return out
+
+
 def arc_poses(
     pose: Pose,
     cmd: Twist,

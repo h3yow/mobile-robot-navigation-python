@@ -170,25 +170,107 @@ def test_partial_arc_advances_to_wall_then_stops():
     _assert_swept_collision_free(s, g, 0.3)
 
 
-def test_sealed_wall_blocks_zero_then_recovers_after_cleared():
-    """端到端：封死动态墙 -> 零速原地 BLOCKED（不穿墙、状态保留）-> 清障后到达。"""
+def test_sealed_wall_advances_to_closest_safe_then_recovers():
+    """端到端：封死动态墙 -> 尽量推进到墙前最后安全位置停住（不穿墙、状态保留、
+    原因可解释）-> 清障后继续推进到达。"""
     rows = [[0] * 40 for _ in range(5)]
     s = _session(rows, max_v=1.0, max_omega=2.0, max_curvature=3.0,
                  max_acc=2.0, footprint_radius=0.3)
     s.plan(Pose(0.5, 2.5, 0.0), Point(39.5, 2.5), time.time())
     s.update_dynamic_obstacles([[3.0, 0.0, 4.0, 5.0]], time.time())
-    log.info("输入：x=3..4 整面封死墙，advance 2s")
-    res = s.advance(2.0, time.time(), dt=2.0, max_v=1.0)
-    log.info("关键判定：blocked=%s sim_t=%.2f 位置 x=%.2f（零速停住）",
-             res.blocked, res.simulated_duration, s.pose.x)
-    assert res.blocked and res.simulated_duration == 0.0
-    assert abs(s.pose.x - 0.5) < 1e-9
+    log.info("输入：x=3..4 整面封死墙（不可绕行），起点 x=0.5，advance 10s")
+    res = s.advance(10.0, time.time(), dt=2.0, max_v=1.0)
+    log.info("关键判定：blocked=%s sim_t=%.2f 停在 x=%.3f（墙前 %.3f m）reason=%s",
+             res.blocked, res.simulated_duration, s.pose.x,
+             3.0 - s.pose.x, res.reason)
+    # 没有一步都不走：从 0.5 推进到墙前最后安全位置（>2.0），
+    # 且始终与墙保持至少一个足迹半径
+    assert res.blocked and not res.arrived
+    assert s.pose.x > 2.0, s.pose.x
+    assert s.pose.x <= 3.0 - 0.3 + 1e-9, s.pose.x
     assert s.status == SessionStatus.BLOCKED
+    assert res.simulated_duration < 10.0  # 没走满：被墙拦停
+    assert "安全位置" in res.reason
+    # 停住原因可解释：note 说明重规划失败且无法绕行
+    assert "重规划失败" in s.last_note and "无法绕行" in s.last_note
+    log.info("状态迁移：->BLOCKED，停住依据：%s", s.last_note)
+    _assert_swept_collision_free(s, s.effective_grid, 0.3)
+    _assert_limits(res.results, s.limits)
+
+    # 会话未卡死：停在原地再推进仍是安全零速/微动，不会穿墙
+    r_again = s.advance(2.0, time.time(), dt=2.0, max_v=1.0)
+    assert r_again.blocked and not r_again.arrived
+    assert s.pose.x <= 3.0 - 0.3 + 1e-9
+    _assert_swept_collision_free(s, s.effective_grid, 0.3)
+
     # 状态保留、不卡死：清空障碍后继续推进到达
     s.update_dynamic_obstacles([], time.time())
     r2 = s.advance(60.0, time.time(), dt=0.2, max_v=1.0)
     assert r2.arrived
     _assert_swept_collision_free(s, s.effective_grid, 0.3)
+    log.info("状态迁移：BLOCKED -> 清障 -> %s（会话可继续，未卡死）", s.status.value)
+
+
+def test_partial_microstep_accel_computed_over_actual_elapsed():
+    """部分推进微步：上报指令的加速度必须按本步实际执行时长核算。
+
+    构造：max_v=0.5、max_acc=0.4、dt=2.0。按整段 dt 限幅时指令 v 可到 0.5，
+    但墙前只能安全走 ~1.2s，按实际时长预算仅 0.48——若按整段时长上报，
+    折算加速度 0.5/1.2≈0.42 > 0.4 超限（修复前的行为）。
+    """
+    rows = [[0] * 20 for _ in range(20)]
+    for x in range(20):
+        rows[10][x] = 1  # y=10 薄墙
+    g = OccupancyGrid.from_raw(rows, resolution=1.0)
+    lim = RobotLimits(0.5, 0.0, 2.0, 3.0, 0.4, 0.3)
+    s = NavigationSession(
+        "acc", g, lim, PlannerParams(0), ControllerParams(dt=0.1), time.time()
+    )
+    s._rebuild_effective_grid()
+    s.pose = Pose(2.0, 9.0, math.pi / 2)
+    s.goal = Point(2.0, 9.65)
+    s.path = [Point(2.0, 9.0), Point(2.0, 9.65)]
+    s.path_index = 0
+    log.info("输入：墙 y=10，机器人 y=9.0 朝墙，max_v=0.5 max_acc=0.4 dt=2.0")
+    r = s._microstep(2.0, None, time.time())
+    log.info(
+        "关键判定：blocked=%s elapsed=%.3f v=%.4f，加速度预算 %.4f，折算 %.4f",
+        r.blocked, r.elapsed, r.cmd.v,
+        lim.max_acc * r.elapsed, abs(r.cmd.v) / max(r.elapsed, 1e-9),
+    )
+    assert r.blocked and 0.0 < r.elapsed < 2.0
+    # 核心断言：按本步实际执行时长折算的加速度不超上限
+    assert abs(r.cmd.v - 0.0) <= lim.max_acc * r.elapsed + 1e-9
+    # 确实推进了（不是零速），且停点安全（足迹不穿墙）
+    assert s.pose.y > 9.0 and s.pose.y < 10.0 - 0.3 + 1e-9
+    _assert_swept_collision_free(s, g, 0.3)
+    # 停住原因可解释
+    assert "加速度" in s.last_note or "触障" in s.last_note
+    log.info("状态迁移：->BLOCKED；%s", s.last_note)
+
+
+def test_advance_partial_steps_respect_accel_end_to_end():
+    """端到端：advance 中的部分微步同样满足按实际时长核算的加速度约束。"""
+    rows = [[0] * 40 for _ in range(5)]
+    s = _session(rows, max_v=1.0, max_omega=2.0, max_curvature=3.0,
+                 max_acc=0.2, footprint_radius=0.3)
+    s.plan(Pose(0.5, 2.5, 0.0), Point(39.5, 2.5), time.time())
+    s.update_dynamic_obstacles([[3.0, 0.0, 4.0, 5.0]], time.time())
+    log.info("输入：封死墙 x=3..4，max_acc=0.2，advance dt=2s（加速爬坡中被拦）")
+    res = s.advance(10.0, time.time(), dt=2.0, max_v=1.0)
+    log.info("关键判定：blocked=%s 停在 x=%.3f sim_t=%.2f",
+             res.blocked, s.pose.x, res.simulated_duration)
+    assert res.blocked
+    # 加速爬坡途中被墙拦住：存在部分微步，且每步（含部分步）都满足
+    # 速度/曲率/按实际时长核算的加速度约束
+    assert any(0.0 < r.elapsed < 2.0 for r in res.results), "应包含部分微步"
+    _assert_limits(res.results, s.limits)
+    _assert_swept_collision_free(s, s.effective_grid, 0.3)
+    assert s.pose.x <= 3.0 - 0.3 + 1e-9
+    # 清障后会话可继续
+    s.update_dynamic_obstacles([], time.time())
+    r2 = s.advance(60.0, time.time(), dt=0.2, max_v=1.0)
+    assert r2.arrived
     log.info("状态迁移：BLOCKED -> 清障 -> %s", s.status.value)
 
 
