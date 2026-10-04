@@ -11,7 +11,7 @@ import math
 import threading
 from collections import deque
 
-from .controller import TrajectoryTracker, arc_poses, integrate_pose
+from .controller import TrajectoryTracker, _wrap_angle, arc_poses, integrate_pose
 from .errors import (
     InvalidInputError,
     SessionStateError,
@@ -40,6 +40,9 @@ MAX_ADVANCE_DURATION = 60.0
 MAX_MICROSTEPS = 20000
 # 轨迹记录默认保留条数；超出后丢弃最旧记录（FIFO 环形缓冲）
 DEFAULT_TRAJECTORY_LIMIT = 2000
+# 部分推进时“收缩时长 -> 按新时长重算指令 -> 复核”的迭代上限
+#（每轮时长严格减小，正常 1~3 轮收敛；超限保守零速，会话仍可继续）
+MAX_PARTIAL_ITERS = 8
 
 
 class AdvanceParams:
@@ -131,6 +134,9 @@ class NavigationSession:
             lookahead_cells=lookahead,
             dt=controller_params.dt,
         )
+        # 用户原始控制器参数（未加前视下限保护）：legacy 步进路径使用，
+        # 保证“不传新增推进参数”时与升级前逐步 step 的结果逐位一致。
+        self.user_controller_params = controller_params
         self.tracker = TrajectoryTracker(limits, controller_params)
 
         self.lock = threading.RLock()
@@ -249,14 +255,134 @@ class NavigationSession:
 
     # ------------------------------------------------------------------
     def step(self, now: float) -> StepResult:
-        """推进一步（默认 dt 与会话速度上限）。"""
+        """推进一步（legacy 语义：与升级前逐步 step 的结果逐位一致）。
+
+        老调用方式（step，或不传 dt/max_v 的 advance）走 ``_legacy_microstep``：
+        用户原始前视距离、欧拉积分、端点足迹复核、整步或零速；
+        新增的扫掠复核/部分推进/圆弧积分只在显式传入推进参数时启用。
+        """
         with self.lock:
             if self.pose is None or self.goal is None or not self.path:
                 raise SessionStateError("会话尚未成功规划，无法步进")
             self._rebuild_effective_grid()
-            return self._microstep(
-                self.controller_params.dt, None, now
+            return self._legacy_microstep(self.user_controller_params.dt, now)
+
+    def _legacy_microstep(self, dt: float, now: float) -> StepResult:
+        """与升级前 step 完全一致的单步语义（调用方须已重建有效栅格并持锁）。
+
+        流程（整步在会话锁内完成，杜绝错序与状态撕裂）：
+          1. 当前位姿安全性；
+          2. 路径通畅性 + 自动重规划；重规划失败 -> BLOCKED 零速（老行为）；
+          3. 到点判定；
+          4. 跟踪器（用户原始参数）算受约束指令；
+          5. 欧拉积分，预测位姿端点足迹复核，触障则拒绝该指令（零速 BLOCKED）；
+          6. 到达目标 -> ARRIVED；成功运动写入轨迹缓冲。
+        """
+        note_parts: list[str] = []
+        cparams = ControllerParams(
+            k_linear=self.user_controller_params.k_linear,
+            k_angular=self.user_controller_params.k_angular,
+            goal_tolerance=self.user_controller_params.goal_tolerance,
+            lookahead_cells=self.user_controller_params.lookahead_cells,
+            dt=dt,
+        )
+        tracker = TrajectoryTracker(self.limits, cparams)
+
+        # 1) 当前位姿安全性
+        if self.effective_grid.footprint_blocked(
+            self.pose.x, self.pose.y, self.limits.footprint_radius
+        ):
+            self.status = SessionStatus.BLOCKED
+            self.last_note = "当前位姿已被障碍占据，无法运动"
+            self._touch(now)
+            return StepResult(
+                pose=self.pose, cmd=_zero_twist(), replanned=False,
+                arrived=False, blocked=True, note=self.last_note,
             )
+
+        # 2) 路径通畅性检查 + 自动重规划
+        replanned = False
+        planner = GridPlanner(self.effective_grid, self.planner_params)
+        blocked_idx = planner.is_path_clear(
+            self.path, self.limits.footprint_radius
+        )
+        if blocked_idx >= 0:
+            note_parts.append(f"路径在第 {blocked_idx} 段被动态障碍阻挡")
+            try:
+                new_path = planner.plan(
+                    Point(self.pose.x, self.pose.y), self.goal
+                )
+                self.path = new_path
+                self.path_index = 0
+                replanned = True
+                note_parts.append(f"自动重规划成功（{len(new_path)} 点）")
+            except Exception as exc:  # 不可达 / 超时 / 起终点非法
+                self.status = SessionStatus.BLOCKED
+                self.last_note = (
+                    f"{'; '.join(note_parts)}；重规划失败：{exc.message if hasattr(exc, 'message') else exc}"
+                )
+                self._touch(now)
+                return StepResult(
+                    pose=self.pose, cmd=_zero_twist(), replanned=False,
+                    arrived=False, blocked=True, note=self.last_note,
+                )
+
+        # 3) 到达判定（在执行运动之前先看是否已经在终点容差内）
+        if tracker.at_goal(self.pose, self.goal):
+            self.status = SessionStatus.ARRIVED
+            self.last_note = "已到达目标"
+            self._touch(now)
+            return StepResult(
+                pose=self.pose, cmd=_zero_twist(), replanned=replanned,
+                arrived=True, blocked=False, note=self.last_note,
+            )
+
+        # 4) 跟踪控制
+        aim, new_idx = tracker.find_aim_point(
+            self.pose, self.path, self.path_index
+        )
+        self.path_index = new_idx
+        cmd = tracker.compute_command(self.pose, aim, self.previous_v)
+        next_pose = tracker.advance(self.pose, cmd)  # 欧拉积分（升级前语义）
+
+        # 5) 运动后碰撞复核：任何时刻不得穿越障碍
+        if self.effective_grid.footprint_blocked(
+            next_pose.x, next_pose.y, self.limits.footprint_radius
+        ):
+            self.status = SessionStatus.BLOCKED
+            self.last_note = "下一步预测位姿触障，拒绝执行该速度指令"
+            self._touch(now)
+            return StepResult(
+                pose=self.pose, cmd=_zero_twist(), replanned=replanned,
+                arrived=False, blocked=True, note=self.last_note,
+            )
+
+        pose_before = self.pose
+        self.pose = next_pose
+        self.previous_v = cmd.v
+        self.step_count += 1
+        arrived = tracker.at_goal(next_pose, self.goal)
+        self.status = (
+            SessionStatus.ARRIVED if arrived else SessionStatus.RUNNING
+        )
+        # 轨迹记录（欧拉扫掠，与上报位姿逐位一致）
+        self._record_motion(
+            pose_before, next_pose, cmd, dt, self._collision_spacing(),
+            arc=False,
+        )
+        note_parts.append(
+            f"步进 {self.step_count}：v={cmd.v:.3f} omega={cmd.omega:.3f} "
+            f"瞄准路径点[{self.path_index}]"
+        )
+        if arrived:
+            note_parts.append("已到达目标")
+        self.last_note = "；".join(note_parts)
+        self._touch(now)
+        return StepResult(
+            pose=next_pose, cmd=cmd, replanned=replanned,
+            arrived=arrived, blocked=False, note=self.last_note,
+            elapsed=dt,
+        )
 
     def _collision_spacing(self) -> float:
         """扫掠碰撞复核的采样间距：1/4 栅格（上限 0.2m，避免细分辨率下过密）。"""
@@ -284,14 +410,16 @@ class NavigationSession:
         max_v_override: float | None,
         now: float,
     ) -> StepResult:
-        """执行一个微步（调用方须已重建有效栅格并持有会话锁）。
+        """执行一个增强微步（调用方须已重建有效栅格并持有会话锁）。
 
-        与单步相同的安全流程，但允许指定 dt 与临时速度上限：
+        显式推进参数（dt/max_v）路径的安全流程：
           1. 当前位姿安全性；
-          2. 路径通畅性 + 自动重规划；
+          2. 路径通畅性 + 自动重规划；重规划失败（前路封死）不立即停住，
+             改为沿原路径继续跟踪，由扫掠复核保证安全、尽量推进；
           3. 到点判定；
           4. 跟踪器算受约束指令（含 dt/速度上限）；
-          5. 整段圆弧扫掠碰撞复核；若全步走不下则二分取最大可行部分，
+          5. 整段圆弧扫掠碰撞复核；若全步走不下则迭代收缩执行时长，
+             并按实际执行时长重算指令的加速度限幅（v/曲率/加速度均不超），
              任何部分都走不下则零速 BLOCKED（原地停住、状态保留）；
           6. 到达目标 -> ARRIVED；成功运动写入轨迹缓冲。
         """
@@ -346,14 +474,13 @@ class NavigationSession:
                 replanned = True
                 note_parts.append(f"自动重规划成功（{len(new_path)} 点）")
             except Exception as exc:  # 不可达 / 超时 / 起终点非法
-                self.status = SessionStatus.BLOCKED
-                self.last_note = (
-                    f"{'; '.join(note_parts)}；重规划失败：{exc.message if hasattr(exc, 'message') else exc}"
-                )
-                self._touch(now)
-                return StepResult(
-                    pose=self.pose, cmd=_zero_twist(), replanned=False,
-                    arrived=False, blocked=True, note=self.last_note,
+                # 前路被封死且绕不过去：不立即停住，沿原（被挡）路径继续跟踪，
+                # 由后续整段扫掠复核保证不穿障/不越界，尽量推进到
+                # 障碍前最近的安全位置；会话状态保留，环境恢复后可继续。
+                msg = exc.message if hasattr(exc, "message") else exc
+                note_parts.append(
+                    f"重规划失败（{msg}），前方路线被封死且无可绕行；"
+                    "沿原路径尽量推进到最近安全位置"
                 )
 
         # 3) 到达判定
@@ -373,31 +500,30 @@ class NavigationSession:
         self.path_index = new_idx
         cmd = tracker.compute_command(self.pose, aim, self.previous_v)
 
-        # 5) 整段扫掠碰撞复核（不只是终点）
+        # 5) 整段扫掠碰撞复核（不只是终点）；走不下时迭代收缩执行时长，
+        #    并始终按“实际执行时长”重算指令的加速度限幅，
+        #    保证上报指令的 |v - v_prev| <= max_acc * 实际执行时长。
         spacing = self._collision_spacing()
-        if not self._arc_collides(self.pose, cmd, dt, spacing):
-            frac = 1.0
-        else:
-            # 全步走不下：二分求最大可行时长比例，能走多少走多少
-            frac = self._max_safe_fraction(self.pose, cmd, dt, spacing)
+        move_dt, cmd = self._safe_partial_command(
+            aim, dt, limits, cparams, spacing, cmd
+        )
 
-        if frac <= 0.0:
+        if move_dt <= 0.0:
             self.status = SessionStatus.BLOCKED
-            self.last_note = (
-                "预测运动轨迹触障/越界（含完整扫掠段复核），拒绝该速度指令，原地停住"
+            note_parts.append(
+                "预测运动轨迹触障/越界（含完整扫掠段复核），"
+                "任何微小运动都不安全，零速原地停住（当前位置即为最近安全位置）"
             )
-            if replanned:
-                self.last_note = "；".join(note_parts + [self.last_note])
+            self.last_note = "；".join(note_parts)
             self._touch(now)
             return StepResult(
                 pose=self.pose, cmd=_zero_twist(), replanned=replanned,
                 arrived=False, blocked=True, note=self.last_note,
             )
 
-        move_dt = dt * frac
+        partial = move_dt < dt
         pose_before = self.pose
         next_pose = integrate_pose(self.pose, cmd, move_dt)
-        partial = frac < 1.0
 
         self.pose = next_pose
         self.previous_v = cmd.v
@@ -419,8 +545,9 @@ class NavigationSession:
         )
         if partial:
             note_parts.append(
-                f"整段 {dt:.3f}s 中仅前 {frac * 100:.1f}%（{move_dt:.3f}s）"
-                "可安全通过，随后轨迹触障/越界，已在该位置停住"
+                f"整段 {dt:.3f}s 中仅前 {move_dt / dt * 100:.1f}%（{move_dt:.3f}s）"
+                "可安全通过，随后轨迹触障/越界，已在该位置停住；"
+                "上报指令已按实际执行时长重新施加加速度限幅"
             )
         if arrived:
             note_parts.append("已到达目标")
@@ -431,6 +558,49 @@ class NavigationSession:
             arrived=arrived, blocked=partial, note=self.last_note,
             elapsed=move_dt,
         )
+
+    def _safe_partial_command(
+        self,
+        aim: Point,
+        dt: float,
+        limits: RobotLimits,
+        cparams: ControllerParams,
+        spacing: float,
+        cmd0: Twist,
+    ) -> tuple[float, Twist | None]:
+        """整段 dt 走不下时，求 (实际执行时长, 满足全部约束的指令)。
+
+        返回的指令按“实际执行时长”施加加速度限幅（|v - v_prev|
+        <= max_acc * 实际时长），且整段圆弧扫掠复核无碰撞/不越界；
+        速度、角速度、曲率包络由 compute_command/clamp_command 保证。
+        任何微小运动都触障（或迭代不收敛）时返回 (0.0, None)。
+        """
+        if not self._arc_collides(self.pose, cmd0, dt, spacing):
+            return dt, cmd0
+        move_dt = dt
+        cmd = cmd0
+        for _ in range(MAX_PARTIAL_ITERS):
+            # 当前指令下二分求最大可行时长比例
+            frac = self._max_safe_fraction(self.pose, cmd, move_dt, spacing)
+            if frac <= 0.0:
+                return 0.0, None
+            move_dt *= frac
+            # 按收缩后的实际执行时长重算指令（加速度预算随之收紧），
+            # 再复核整段；若仍触障（如减速段指令变快）则继续收缩。
+            cparams_i = ControllerParams(
+                k_linear=cparams.k_linear,
+                k_angular=cparams.k_angular,
+                goal_tolerance=cparams.goal_tolerance,
+                lookahead_cells=cparams.lookahead_cells,
+                dt=move_dt,
+            )
+            cmd = TrajectoryTracker(limits, cparams_i).compute_command(
+                self.pose, aim, self.previous_v
+            )
+            if not self._arc_collides(self.pose, cmd, move_dt, spacing):
+                return move_dt, cmd
+        # 罕见不收敛：保守零速（会话状态保留，可继续推进/重规划）
+        return 0.0, None
 
     def _max_safe_fraction(
         self, pose: Pose, cmd: Twist, dt: float, spacing: float
@@ -459,8 +629,15 @@ class NavigationSession:
         cmd: Twist,
         move_dt: float,
         spacing: float,
+        *,
+        arc: bool = True,
     ) -> None:
-        """把一次已执行的微步写入轨迹环形缓冲。"""
+        """把一次已执行的微步写入轨迹环形缓冲。
+
+        arc=True 用于圆弧积分微步（advance 显式推进参数路径）；
+        arc=False 用于 legacy 欧拉微步（step / 默认参数 advance），
+        两种采样都保证 swept[-1] 与上报位姿逐位一致。
+        """
         travel = abs(cmd.v) * move_dt
         if travel <= 0:
             swept = [start_pose, end_pose]
@@ -470,9 +647,10 @@ class NavigationSession:
             store_spacing = max(
                 spacing, travel / (MAX_SWIPT_POINTS_PER_RECORD - 1)
             )
-            swept = arc_poses(
-                start_pose, cmd, move_dt, store_spacing
-            )
+            if arc:
+                swept = arc_poses(start_pose, cmd, move_dt, store_spacing)
+            else:
+                swept = _euler_poses(start_pose, cmd, move_dt, store_spacing)
         record = TrajectoryRecord(
             step=self.step_count,
             pose=end_pose,
@@ -501,7 +679,11 @@ class NavigationSession:
         - dt：本次推进使用的微步间隔（秒），缺省用会话默认 controller.dt；
         - max_v：本次推进临时速度上限，缺省用会话 limits.max_v；
           两者只影响本次调用，不改动会话配置。
-        - 每个微步都做完整的扫掠碰撞/越界/约束复核：
+        - 不传 dt/max_v 时，每个微步与逐步 step 使用完全相同的 legacy
+          语义（欧拉积分/端点复核/整步或零速），逐位姿结果一致；
+          显式传入任一参数时启用增强微步（圆弧积分/整段扫掠复核/
+          部分推进且指令按实际执行时长限幅、封死时尽量推进）。
+        - 增强微步都做完整的扫掠碰撞/越界/约束复核：
           能走多少走多少（部分微步也会停在安全位置），走不动就原地停住。
         - 被挡住/到达后会话状态完整保留，可继续 advance / step / replan。
         """
@@ -510,7 +692,8 @@ class NavigationSession:
             if self.pose is None or self.goal is None or not self.path:
                 raise SessionStateError("会话尚未成功规划，无法推进")
 
-            step_dt = params.dt or self.controller_params.dt
+            legacy = params.dt is None and params.max_v is None
+            step_dt = params.dt or self.user_controller_params.dt
             remaining = params.duration
             results: list[StepResult] = []
             executed = 0.0
@@ -522,7 +705,10 @@ class NavigationSession:
             while remaining > 1e-12 and n_micro < MAX_MICROSTEPS:
                 self._rebuild_effective_grid()
                 cur_dt = min(step_dt, remaining)
-                r = self._microstep(cur_dt, params.max_v, now)
+                if legacy:
+                    r = self._legacy_microstep(cur_dt, now)
+                else:
+                    r = self._microstep(cur_dt, params.max_v, now)
                 results.append(r)
                 n_micro += 1
                 if r.arrived:
@@ -535,14 +721,15 @@ class NavigationSession:
                     stop_blocked = True
                     if r.elapsed <= 0.0 and _same_pose(r.pose, start_pose):
                         reason = (
-                            "起始方向即被阻挡（预测轨迹触障/越界或路径不可达），"
-                            "原地停住；环境变化或重规划后可继续"
+                            "起始位置即无法安全运动（前方路线被障碍封死且无法绕行，"
+                            "或任何微小运动都触障/越界），原地停住；"
+                            "清障、更换环境或重新规划后可继续"
                         )
                     else:
                         reason = (
-                            "推进途中剩余路线被障碍/边界阻挡，"
-                            "已在最后安全位置停住（本微步仅前半段可通行）；"
-                            "环境变化或重规划后可继续"
+                            "推进途中前方路线被障碍/边界阻挡，"
+                            "已推进到最靠近的安全位置停住（未穿障、未越界）；"
+                            "清障、更换环境或重新规划后可继续"
                         )
                     remaining = 0.0
                     break
@@ -642,6 +829,29 @@ class NavigationSession:
 
 def _zero_twist() -> Twist:
     return Twist(v=0.0, omega=0.0)
+
+
+def _euler_poses(
+    pose: Pose, cmd: Twist, dt: float, spacing: float
+) -> list[Pose]:
+    """采样 legacy 欧拉微步的扫过位姿（位置沿初始朝向直线、角度线性）。
+
+    与 ``TrajectoryTracker.advance`` 的离散模型一致：
+    f=1 时逐位等于欧拉积分结果，保证轨迹记录与上报位姿严格对齐。
+    """
+    travel = abs(cmd.v) * dt
+    n = max(1, math.ceil(travel / spacing)) if travel > 0 else 1
+    out: list[Pose] = []
+    for i in range(n + 1):
+        f = i / n
+        out.append(
+            Pose(
+                x=pose.x + cmd.v * math.cos(pose.theta) * dt * f,
+                y=pose.y + cmd.v * math.sin(pose.theta) * dt * f,
+                theta=_wrap_angle(pose.theta + cmd.omega * dt * f),
+            )
+        )
+    return out
 
 
 def _same_pose(a: Pose, b: Pose) -> bool:
